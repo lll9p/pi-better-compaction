@@ -54,6 +54,12 @@ On the next supported Responses request after a native `/responses/compact`, the
 Requests produced by the native-method fallback carry Pi's standard `{readFiles, modifiedFiles}`
 details, so they replay through Pi's default path — no rewrite, no special handling.
 
+By default, a session whose latest compaction is not a stored native opaque window does not attempt
+`/responses/compact`, preserving strict replay continuity. Set `allowCompactionContinuityBreak` to
+`true` to restart native compaction from Pi's current effective context instead. Any information
+already omitted by Pi's text summary cannot be recovered, but the successful compact response
+becomes the new opaque replay checkpoint for later turns.
+
 ### Selection is by API, not provider
 
 Any provider speaking a Responses API gets a native compact attempt, including OpenAI-compatible
@@ -98,6 +104,7 @@ A missing file silently uses the defaults below. The extension never writes this
 ```json
 {
   "enabled": true,
+  "allowCompactionContinuityBreak": false,
 
   "compactionModel": "openai/gpt-5.1-mini",
   "compactionThinkingLevel": "off",
@@ -116,6 +123,7 @@ A missing file silently uses the defaults below. The extension never writes this
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enabled` | `true` | Master switch. `false` → Pi default compaction everywhere. |
+| `allowCompactionContinuityBreak` | `false` | Opt in to native compact recovery when the latest session compaction was created by Pi or another non-native path. The extension serializes `buildSessionContext().messages`, including Pi's text summary, into a new `/responses/compact` request. This sacrifices strict opaque-window continuity at that boundary; a successful response establishes a new native replay chain. |
 | `compactionModel` | *(unset)* | `"provider/model-id"` used for native-method fallback (non-Responses APIs, or when the compact endpoint fails). `null`/unset → use the current model via Pi's default path. The provider is split on the first `/`, so model ids may contain slashes (e.g. `"openrouter/deepseek/deepseek-chat"`). |
 | `compactionThinkingLevel` | `"off"` | Thinking level passed to the native `compact()` fallback. One of `off, minimal, low, medium, high, xhigh, max`. |
 | `responsesCompactApis` | both Responses APIs | Which Responses APIs use the compact endpoint. May only narrow the built-in set; unknown entries are ignored with a warning. |
