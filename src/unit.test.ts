@@ -229,3 +229,46 @@ test("executeNativeCompaction serializes codex-aligned passthrough fields and ex
 	expect(requestBody.text).toEqual({ verbosity: "low" });
 	expect("service_tier" in requestBody).toBe(false);
 });
+
+test("isNativeCompactionDetails accepts both V1 and V2 strategy constants", () => {
+	const { isNativeCompactionDetails, createNativeCompactionDetails, NATIVE_COMPACTION_STRATEGY, NATIVE_COMPACTION_STRATEGY_V2 } = require("./types");
+
+	const v1Details = createNativeCompactionDetails({
+		provider: "openai",
+		api: "openai-responses",
+		model: "gpt-5-mini",
+		baseUrl: "https://api.openai.com/v1",
+		compactedWindow: [{ type: "compaction", encrypted_content: "blob" }],
+		createdAt: new Date().toISOString(),
+	});
+	expect(v1Details.strategy).toBe(NATIVE_COMPACTION_STRATEGY);
+	expect(isNativeCompactionDetails(v1Details)).toBe(true);
+
+	const v2Details = createNativeCompactionDetails(
+		{
+			provider: "openai",
+			api: "openai-responses",
+			model: "gpt-5-mini",
+			baseUrl: "https://api.openai.com/v1",
+			compactedWindow: [{ type: "compaction", encrypted_content: "blob" }],
+			createdAt: new Date().toISOString(),
+		},
+		NATIVE_COMPACTION_STRATEGY_V2,
+	);
+	expect(v2Details.strategy).toBe(NATIVE_COMPACTION_STRATEGY_V2);
+	expect(isNativeCompactionDetails(v2Details)).toBe(true);
+});
+
+test("isNativeCompactionDetails rejects unknown strategy values", () => {
+	const { isNativeCompactionDetails } = require("./types");
+
+	expect(isNativeCompactionDetails({
+		strategy: "openai-native-compact-v3",
+		provider: "openai",
+		api: "openai-responses",
+		model: "gpt-5-mini",
+		baseUrl: "https://api.openai.com/v1",
+		compactedWindow: [],
+		createdAt: new Date().toISOString(),
+	})).toBe(false);
+});

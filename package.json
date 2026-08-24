@@ -1,6 +1,6 @@
 {
   "name": "@lll9p/pi-better-compaction",
-  "version": "0.2.1",
+  "version": "0.4.0",
   "type": "module",
   "description": "Better compaction for pi: native /responses/compact replay for OpenAI Responses APIs, plus a configurable compaction model driving pi's native summarization everywhere else.",
   "author": "Lilin Lao",
@@ -33,6 +33,7 @@
   "files": [
     "index.ts",
     "src/compact-client.ts",
+    "src/compact-client-v2.ts",
     "src/config.ts",
     "src/debug.ts",
     "src/details-store.ts",
@@ -40,11 +41,14 @@
     "src/native-fallback.ts",
     "src/payload-rewrite.ts",
     "src/request-context-cache.ts",
+    "src/retained-messages.ts",
     "src/runtime.ts",
     "src/serializer.ts",
+    "src/shared-headers.ts",
     "src/supported-environment.ts",
     "src/types.ts",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE"
   ],
   "scripts": {
@@ -55,6 +59,6 @@
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": ">=0.80.0"
+    "@earendil-works/pi-coding-agent": ">=0.84.3"
   }
 }

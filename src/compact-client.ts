@@ -1,6 +1,7 @@
 import { writeDebugArtifact } from "./debug";
 import type { NativeCompactionRuntime } from "./runtime";
 import type { NativeCompactionRequestBody } from "./serializer";
+import { isAbortError, toHeaders } from "./shared-headers";
 import type { ArtifactContext, ExtensionConfig } from "./types";
 
 const JSON_CONTENT_TYPE = "application/json";
@@ -55,13 +56,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function isAbortError(error: unknown): boolean {
-	return (
-		(error instanceof DOMException && error.name === "AbortError") ||
-		(error instanceof Error && (error.name === "AbortError" || error.name === "ABORT_ERR"))
-	);
-}
-
 function normalizeResponseTimestamp(value: unknown): string | undefined {
 	if (typeof value === "number" && Number.isFinite(value)) {
 		const milliseconds = value > 1_000_000_000_000 ? value : value * 1000;
@@ -109,62 +103,6 @@ export function extractCompactedSummaryText(output: readonly unknown[]): string 
 
 	const joined = texts.join("\n\n").trim();
 	return joined.length > 0 ? joined : undefined;
-}
-
-function decodeJwtPayload(token: string): Record<string, unknown> | undefined {
-	const parts = token.split(".");
-	if (parts.length !== 3) {
-		return undefined;
-	}
-
-	try {
-		const payloadText = Buffer.from(parts[1]!, "base64url").toString("utf8");
-		const payload = JSON.parse(payloadText);
-		return isRecord(payload) ? payload : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function extractCodexAccountId(token: string): string | undefined {
-	const payload = decodeJwtPayload(token);
-	const authClaims = payload?.["https://api.openai.com/auth"];
-	if (!isRecord(authClaims)) {
-		return undefined;
-	}
-
-	const accountId = authClaims.chatgpt_account_id;
-	return typeof accountId === "string" && accountId.trim().length > 0 ? accountId.trim() : undefined;
-}
-
-function buildCodexUserAgent(): string {
-	const platform = typeof process !== "undefined" ? process.platform : "browser";
-	const arch = typeof process !== "undefined" ? process.arch : "unknown";
-	return `pi (${platform}; ${arch})`;
-}
-
-function toHeaders(runtime: NativeCompactionRuntime): Record<string, string> {
-	const headers = new Headers(runtime.currentModel.headers ?? {});
-	for (const [key, value] of Object.entries(runtime.headers ?? {})) {
-		headers.set(key, value);
-	}
-	headers.set("accept", JSON_CONTENT_TYPE);
-	headers.set("content-type", JSON_CONTENT_TYPE);
-	if (!headers.has("authorization")) {
-		headers.set("authorization", `Bearer ${runtime.apiKey}`);
-	}
-
-	if (runtime.api === "openai-codex-responses") {
-		const accountId = extractCodexAccountId(runtime.apiKey);
-		if (accountId) {
-			headers.set("chatgpt-account-id", accountId);
-		}
-		headers.set("originator", "pi");
-		headers.set("user-agent", buildCodexUserAgent());
-		headers.set("openai-beta", "responses=experimental");
-	}
-
-	return Object.fromEntries(headers.entries());
 }
 
 function writeCompactArtifact(

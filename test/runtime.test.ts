@@ -1,5 +1,37 @@
 import { describe, expect, test } from "bun:test";
-import { resolveNativeCompactionEnvironment } from "../src/runtime";
+import { buildResponsesUrl, resolveNativeCompactionEnvironment } from "../src/runtime";
+
+describe("buildResponsesUrl", () => {
+	test("builds openai responses URL", () => {
+		expect(buildResponsesUrl("https://api.openai.com/v1", "openai-responses")).toBe(
+			"https://api.openai.com/v1/responses",
+		);
+	});
+
+	test("builds codex responses URL", () => {
+		expect(buildResponsesUrl("https://chatgpt.com/backend-api", "openai-codex-responses")).toBe(
+			"https://chatgpt.com/backend-api/codex/responses",
+		);
+	});
+
+	test("handles baseUrl already ending in /codex for codex API", () => {
+		expect(buildResponsesUrl("https://chatgpt.com/backend-api/codex", "openai-codex-responses")).toBe(
+			"https://chatgpt.com/backend-api/codex/responses",
+		);
+	});
+
+	test("handles baseUrl already ending in /codex/responses for codex API", () => {
+		expect(buildResponsesUrl("https://chatgpt.com/backend-api/codex/responses", "openai-codex-responses")).toBe(
+			"https://chatgpt.com/backend-api/codex/responses",
+		);
+	});
+
+	test("handles baseUrl already ending in /responses for openai API", () => {
+		expect(buildResponsesUrl("https://api.openai.com/v1/responses", "openai-responses")).toBe(
+			"https://api.openai.com/v1/responses",
+		);
+	});
+});
 
 describe("resolveNativeCompactionEnvironment", () => {
 	test("uses getApiKeyAndHeaders to resolve request auth", async () => {
@@ -7,12 +39,12 @@ describe("resolveNativeCompactionEnvironment", () => {
 			model: {
 				provider: "openai",
 				api: "openai-responses",
-				id: "gpt-5.4",
+				id: "gpt-5.6-sol",
 				baseUrl: "https://example.com/v1",
 			},
 			modelRegistry: {
 				async getApiKeyAndHeaders(model: { provider: string; id: string }) {
-					if (model.provider !== "openai" || model.id !== "gpt-5.4") {
+					if (model.provider !== "openai" || model.id !== "gpt-5.6-sol") {
 						return { ok: false, error: "unexpected model" };
 					}
 					return {
@@ -31,7 +63,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 			runtime: expect.objectContaining({
 				provider: "openai",
 				api: "openai-responses",
-				model: "gpt-5.4",
+				model: "gpt-5.6-sol",
 				baseUrl: "https://example.com/v1",
 				apiKey: "sk-openai",
 				headers: {
@@ -39,6 +71,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 				},
 				compactPath: "responses/compact",
 				compactUrl: "https://example.com/v1/responses/compact",
+				responsesUrl: "https://example.com/v1/responses",
 			}),
 		});
 	});
@@ -48,7 +81,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 			model: {
 				provider: "openai",
 				api: "openai-responses",
-				id: "gpt-5.4",
+				id: "gpt-5.6-sol",
 				baseUrl: "https://example.com/v1",
 			},
 			modelRegistry: {
@@ -69,7 +102,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 			reason: "missing-api-key",
 			provider: "openai",
 			api: "openai-responses",
-			model: "gpt-5.4",
+			model: "gpt-5.6-sol",
 			baseUrl: "https://example.com/v1",
 		});
 	});
@@ -79,12 +112,12 @@ describe("resolveNativeCompactionEnvironment", () => {
 			model: {
 				provider: "custom-litellm",
 				api: "openai-responses",
-				id: "gpt-5.4",
+				id: "gpt-5.6-sol",
 				baseUrl: "https://proxy.example.com/v1",
 			},
 			modelRegistry: {
 				async getApiKeyAndHeaders(model: { provider: string; id: string }) {
-					if (model.provider !== "custom-litellm" || model.id !== "gpt-5.4") {
+					if (model.provider !== "custom-litellm" || model.id !== "gpt-5.6-sol") {
 						return { ok: false, error: "unexpected model" };
 					}
 					return {
@@ -103,7 +136,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 			runtime: expect.objectContaining({
 				provider: "custom-litellm",
 				api: "openai-responses",
-				model: "gpt-5.4",
+				model: "gpt-5.6-sol",
 				baseUrl: "https://proxy.example.com/v1",
 				apiKey: "sk-custom-litellm",
 				headers: {
@@ -120,7 +153,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 			model: {
 				provider: "anthropic",
 				api: "anthropic-messages",
-				id: "claude-fable-5",
+				id: "claude-sonnet-5",
 				baseUrl: "https://api.anthropic.com",
 			},
 			modelRegistry: {
@@ -135,7 +168,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 			reason: "unsupported-api",
 			provider: "anthropic",
 			api: "anthropic-messages",
-			model: "claude-fable-5",
+			model: "claude-sonnet-5",
 			baseUrl: "https://api.anthropic.com",
 		});
 	});
@@ -146,7 +179,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 				model: {
 					provider: "openai",
 					api: "openai-responses",
-					id: "gpt-5.4",
+					id: "gpt-5.6-sol",
 					baseUrl: "https://example.com/v1",
 				},
 				modelRegistry: {
@@ -165,8 +198,43 @@ describe("resolveNativeCompactionEnvironment", () => {
 			reason: "unsupported-api",
 			provider: "openai",
 			api: "openai-responses",
-			model: "gpt-5.4",
+			model: "gpt-5.6-sol",
 			baseUrl: "https://example.com/v1",
+		});
+	});
+
+	test("filters null-valued headers from ProviderHeaders", async () => {
+		const resolution = await resolveNativeCompactionEnvironment({
+			model: {
+				provider: "openai",
+				api: "openai-responses",
+				id: "gpt-5.6-sol",
+				baseUrl: "https://example.com/v1",
+			},
+			modelRegistry: {
+				async getApiKeyAndHeaders() {
+					return {
+						ok: true,
+						apiKey: "sk-openai",
+						headers: {
+							"x-keep": "yes",
+							"x-remove": null,
+							"x-also-keep": "ok",
+						},
+					};
+				},
+			},
+		} as any);
+
+		expect(resolution).toEqual({
+			ok: true,
+			runtime: expect.objectContaining({
+				apiKey: "sk-openai",
+				headers: {
+					"x-keep": "yes",
+					"x-also-keep": "ok",
+				},
+			}),
 		});
 	});
 });

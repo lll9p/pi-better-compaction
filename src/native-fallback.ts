@@ -26,6 +26,7 @@ export type NativeFallbackResult =
 			ok: true;
 			result: CompactionResult;
 			model: { provider: string; id: string };
+			usage?: CompactionResult["usage"];
 	  }
 	| {
 			ok: false;
@@ -38,8 +39,20 @@ export type NativeFallbackResult =
 export type NativeCompactFn = typeof compact;
 
 type ResolvedAuth =
-	| { ok: true; apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> }
+	| { ok: true; apiKey?: string; headers?: Record<string, string | null>; env?: Record<string, string> }
 	| { ok: false; error: string };
+
+/** Strip null-valued entries so downstream consumers receive a clean Record<string, string>. */
+function filterNullHeaders(headers: Record<string, string | null> | undefined): Record<string, string> | undefined {
+	if (!headers) return undefined;
+	const filtered: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+		if (value !== null) {
+			filtered[key] = value;
+		}
+	}
+	return Object.keys(filtered).length > 0 ? filtered : undefined;
+}
 
 /** Parse "provider/model-id" (model ids may themselves contain slashes). */
 export function parseModelSpec(spec: string): ParsedModelSpec | undefined {
@@ -82,6 +95,7 @@ export async function runNativeFallbackCompaction(args: {
 	event: SessionBeforeCompactEvent;
 	config: ExtensionConfig;
 	compactFn?: NativeCompactFn;
+	sessionId?: string;
 }): Promise<NativeFallbackResult> {
 	const { ctx, event, config } = args;
 	const compactFn = args.compactFn ?? compact;
@@ -120,12 +134,15 @@ export async function runNativeFallbackCompaction(args: {
 			event.preparation,
 			model,
 			auth.apiKey,
-			auth.headers,
+			filterNullHeaders(auth.headers),
 			event.customInstructions,
 			event.signal,
 			config.compactionThinkingLevel,
-			undefined,
+			undefined, // streamFn
 			auth.env,
+			undefined, // retry (use pi defaults)
+			undefined, // callbacks
+			args.sessionId,
 		);
 
 		if (event.signal.aborted) {
@@ -139,6 +156,7 @@ export async function runNativeFallbackCompaction(args: {
 			ok: true,
 			result,
 			model: { provider: model.provider, id: model.id },
+			usage: result.usage,
 		};
 	} catch (error) {
 		if (event.signal.aborted || isAbortError(error)) {

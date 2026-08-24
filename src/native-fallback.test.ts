@@ -72,10 +72,10 @@ describe("parseModelSpec", () => {
 	test("splits on the first slash so model ids may contain slashes", async () => {
 		const { parseModelSpec } = await loadNativeFallbackModule();
 
-		expect(parseModelSpec("openai/gpt-5-mini")).toEqual({ provider: "openai", modelId: "gpt-5-mini" });
-		expect(parseModelSpec("openrouter/deepseek/deepseek-chat-v3")).toEqual({
+		expect(parseModelSpec("openai/gpt-5.6-luna")).toEqual({ provider: "openai", modelId: "gpt-5.6-luna" });
+		expect(parseModelSpec("openrouter/deepseek/deepseek-v4-pro")).toEqual({
 			provider: "openrouter",
-			modelId: "deepseek/deepseek-chat-v3",
+			modelId: "deepseek/deepseek-v4-pro",
 		});
 		expect(parseModelSpec("  google/gemini-2.5-flash  ")).toEqual({
 			provider: "google",
@@ -86,8 +86,8 @@ describe("parseModelSpec", () => {
 	test("rejects specs without both provider and model id", async () => {
 		const { parseModelSpec } = await loadNativeFallbackModule();
 
-		expect(parseModelSpec("gpt-5-mini")).toBeUndefined();
-		expect(parseModelSpec("/gpt-5-mini")).toBeUndefined();
+		expect(parseModelSpec("gpt-5.6-luna")).toBeUndefined();
+		expect(parseModelSpec("/gpt-5.6-luna")).toBeUndefined();
 		expect(parseModelSpec("openai/")).toBeUndefined();
 		expect(parseModelSpec("")).toBeUndefined();
 	});
@@ -132,18 +132,18 @@ describe("runNativeFallbackCompaction", () => {
 
 	test("returns same-as-current-model so pi's default path keeps streaming UI", async () => {
 		const { runNativeFallbackCompaction } = await loadNativeFallbackModule();
-		const model = { provider: "anthropic", id: "claude-fable-5" };
+		const model = { provider: "anthropic", id: "claude-sonnet-5" };
 
 		const result = await runNativeFallbackCompaction({
 			ctx: createCtx({ currentModel: model, registryModels: [model] }),
 			event: createEvent(),
-			config: createConfig({ compactionModel: "anthropic/claude-fable-5" }),
+			config: createConfig({ compactionModel: "anthropic/claude-sonnet-5" }),
 		});
 
 		expect(result).toEqual({
 			ok: false,
 			reason: "same-as-current-model",
-			modelSpec: "anthropic/claude-fable-5",
+			modelSpec: "anthropic/claude-sonnet-5",
 		});
 	});
 
@@ -152,7 +152,7 @@ describe("runNativeFallbackCompaction", () => {
 
 		const result = await runNativeFallbackCompaction({
 			ctx: createCtx({
-				currentModel: { provider: "anthropic", id: "claude-fable-5" },
+				currentModel: { provider: "anthropic", id: "claude-sonnet-5" },
 				registryModels: [{ provider: "google", id: "gemini-2.5-flash" }],
 				auth: { ok: false, error: "no API key configured" },
 			}),
@@ -182,7 +182,7 @@ describe("runNativeFallbackCompaction", () => {
 		const event = createEvent();
 		const result = await runNativeFallbackCompaction({
 			ctx: createCtx({
-				currentModel: { provider: "anthropic", id: "claude-fable-5" },
+				currentModel: { provider: "anthropic", id: "claude-sonnet-5" },
 				registryModels: [fallbackModel],
 			}),
 			event,
@@ -197,9 +197,10 @@ describe("runNativeFallbackCompaction", () => {
 			ok: true,
 			result: compactionResult,
 			model: { provider: "google", id: "gemini-2.5-flash" },
+			usage: undefined,
 		});
 		expect(compactCalls.length).toBe(1);
-		const [preparation, model, apiKey, headers, customInstructions, signal, thinkingLevel, streamFn, env] =
+		const [preparation, model, apiKey, headers, customInstructions, signal, thinkingLevel, streamFn, env, retry, callbacks, sessionId] =
 			compactCalls[0]!;
 		expect(preparation).toBe((event as { preparation: unknown }).preparation);
 		expect(model).toBe(fallbackModel as never);
@@ -210,6 +211,9 @@ describe("runNativeFallbackCompaction", () => {
 		expect(thinkingLevel).toBe("low");
 		expect(streamFn).toBeUndefined();
 		expect(env).toEqual({ E: "1" });
+		expect(retry).toBeUndefined();
+		expect(callbacks).toBeUndefined();
+		expect(sessionId).toBeUndefined();
 	});
 
 	test("maps abort errors from compact() to the aborted reason", async () => {
@@ -276,5 +280,79 @@ describe("runNativeFallbackCompaction", () => {
 			reason: "empty-summary",
 			modelSpec: "google/gemini-2.5-flash",
 		});
+	});
+
+	test("passes sessionId through to compact() when provided", async () => {
+		const { runNativeFallbackCompaction } = await loadNativeFallbackModule();
+		const compactCalls: unknown[][] = [];
+
+		await runNativeFallbackCompaction({
+			ctx: createCtx({
+				currentModel: { provider: "anthropic", id: "claude-sonnet-5" },
+				registryModels: [{ provider: "google", id: "gemini-2.5-flash" }],
+			}),
+			event: createEvent(),
+			config: createConfig({ compactionModel: "google/gemini-2.5-flash" }),
+			compactFn: (async (...args: unknown[]) => {
+				compactCalls.push(args);
+				return { summary: "ok", firstKeptEntryId: "e1", tokensBefore: 100 };
+			}) as never,
+			sessionId: "sess-abc-123",
+		});
+
+		expect(compactCalls.length).toBe(1);
+		expect(compactCalls[0]![11]).toBe("sess-abc-123"); // 12th arg = sessionId
+	});
+
+	test("forwards CompactionResult.usage when present", async () => {
+		const { runNativeFallbackCompaction } = await loadNativeFallbackModule();
+		const usage = { inputTokens: 5000, outputTokens: 800 };
+
+		const result = await runNativeFallbackCompaction({
+			ctx: createCtx({
+				currentModel: { provider: "anthropic", id: "claude-sonnet-5" },
+				registryModels: [{ provider: "google", id: "gemini-2.5-flash" }],
+			}),
+			event: createEvent(),
+			config: createConfig({ compactionModel: "google/gemini-2.5-flash" }),
+			compactFn: (async () => ({
+				summary: "## Compacted",
+				firstKeptEntryId: "entry-keep",
+				tokensBefore: 1234,
+				usage,
+			})) as never,
+		});
+
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.usage).toEqual(usage);
+		}
+	});
+
+	test("filters null-valued headers from auth before passing to compact()", async () => {
+		const { runNativeFallbackCompaction } = await loadNativeFallbackModule();
+		const compactCalls: unknown[][] = [];
+
+		await runNativeFallbackCompaction({
+			ctx: createCtx({
+				currentModel: { provider: "anthropic", id: "claude-sonnet-5" },
+				registryModels: [{ provider: "google", id: "gemini-2.5-flash" }],
+				auth: {
+					ok: true,
+					apiKey: "sk-test",
+					headers: { "x-keep": "yes", "x-remove": null, "x-also-keep": "ok" },
+					env: {},
+				},
+			}),
+			event: createEvent(),
+			config: createConfig({ compactionModel: "google/gemini-2.5-flash" }),
+			compactFn: (async (...args: unknown[]) => {
+				compactCalls.push(args);
+				return { summary: "ok", firstKeptEntryId: "e1", tokensBefore: 100 };
+			}) as never,
+		});
+
+		expect(compactCalls.length).toBe(1);
+		expect(compactCalls[0]![3]).toEqual({ "x-keep": "yes", "x-also-keep": "ok" });
 	});
 });

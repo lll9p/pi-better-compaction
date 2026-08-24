@@ -4,6 +4,8 @@ import { RESPONSES_COMPACT_CAPABLE_APIS } from "./types";
 
 const OPENAI_COMPACT_PATH = "responses/compact";
 const CODEX_COMPACT_PATH = "codex/responses/compact";
+const OPENAI_RESPONSES_PATH = "responses";
+const CODEX_RESPONSES_PATH = "codex/responses";
 
 type ResponsesCompactApi = (typeof RESPONSES_COMPACT_CAPABLE_APIS)[number];
 
@@ -40,6 +42,7 @@ export type NativeCompactionRuntime = {
 	headers?: Record<string, string>;
 	compactPath: string;
 	compactUrl: string;
+	responsesUrl: string;
 	payload?: ResponsesCompatibleRequestPayload;
 	currentModel: RuntimeModel;
 };
@@ -74,6 +77,29 @@ export function normalizeBaseUrl(baseUrl: string | undefined | null): string | u
 	return normalized ? normalized : undefined;
 }
 
+function buildOpenAIResponsesUrl(baseUrl: string): string {
+	const normalized = normalizeBaseUrl(baseUrl) ?? baseUrl;
+	if (normalized.endsWith("/responses")) {
+		return normalized;
+	}
+	return `${normalized}/${OPENAI_RESPONSES_PATH}`;
+}
+
+function buildCodexResponsesUrl(baseUrl: string): string {
+	const normalized = normalizeBaseUrl(baseUrl) ?? baseUrl;
+	if (normalized.endsWith("/codex/responses")) {
+		return normalized;
+	}
+	if (normalized.endsWith("/codex")) {
+		return `${normalized}/responses`;
+	}
+	return `${normalized}/${CODEX_RESPONSES_PATH}`;
+}
+
+export function buildResponsesUrl(baseUrl: string, api: ResponsesCompactApi): string {
+	return api === "openai-codex-responses" ? buildCodexResponsesUrl(baseUrl) : buildOpenAIResponsesUrl(baseUrl);
+}
+
 function buildOpenAICompactUrl(baseUrl: string): string {
 	const normalized = normalizeBaseUrl(baseUrl) ?? baseUrl;
 	if (normalized.endsWith("/responses")) {
@@ -101,13 +127,25 @@ export function buildCompactPath(api: ResponsesCompactApi): string {
 	return api === "openai-codex-responses" ? CODEX_COMPACT_PATH : OPENAI_COMPACT_PATH;
 }
 
+/** Strip null-valued entries so downstream consumers receive a clean Record<string, string>. */
+function filterNullHeaders(headers: Record<string, string | null> | undefined): Record<string, string> | undefined {
+	if (!headers) return undefined;
+	const filtered: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+		if (value !== null) {
+			filtered[key] = value;
+		}
+	}
+	return Object.keys(filtered).length > 0 ? filtered : undefined;
+}
+
 async function resolveRequestAuth(
 	ctx: ExtensionContext,
 	model: RuntimeModel,
 ): Promise<{ apiKey?: string; headers?: Record<string, string> }> {
 	const modelRegistry = ctx.modelRegistry as {
 		getApiKeyAndHeaders?: (currentModel: RuntimeModel) => Promise<
-			| { ok: true; apiKey?: string; headers?: Record<string, string> }
+			| { ok: true; apiKey?: string; headers?: Record<string, string | null> }
 			| { ok: false; error: string }
 		>;
 	};
@@ -117,7 +155,7 @@ async function resolveRequestAuth(
 	}
 
 	const auth = await modelRegistry.getApiKeyAndHeaders(model);
-	return auth.ok ? { apiKey: auth.apiKey, headers: auth.headers } : {};
+	return auth.ok ? { apiKey: auth.apiKey, headers: filterNullHeaders(auth.headers) } : {};
 }
 
 export function isSupportedApi(api: string): api is ResponsesCompactApi {
@@ -234,6 +272,7 @@ export async function resolveNativeCompactionEnvironment(
 			headers,
 			compactPath: buildCompactPath(descriptor.api),
 			compactUrl: buildCompactUrl(descriptor.baseUrl, descriptor.api),
+			responsesUrl: buildResponsesUrl(descriptor.baseUrl, descriptor.api),
 			payload: requestPayload,
 			currentModel,
 		},

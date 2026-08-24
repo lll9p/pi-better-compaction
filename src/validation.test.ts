@@ -46,6 +46,7 @@ type HookHandler = (event: unknown, ctx: unknown) => Promise<unknown>;
 
 type HookHarnessOptions = {
 	compactResult?: Record<string, unknown>;
+	v2CompactResult?: Record<string, unknown>;
 	config?: Partial<ExtensionConfig>;
 	nativeFallbackResult?: Record<string, unknown>;
 };
@@ -327,9 +328,11 @@ async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 	sessionBeforeCompact: HookHandler;
 	beforeProviderRequest: HookHandler;
 	compactCalls: Array<Record<string, unknown>>;
+	v2CompactCalls: Array<Record<string, unknown>>;
 	fallbackCalls: Array<Record<string, unknown>>;
 }> {
 	const compactCalls: Array<Record<string, unknown>> = [];
+	const v2CompactCalls: Array<Record<string, unknown>> = [];
 	const fallbackCalls: Array<Record<string, unknown>> = [];
 
 	registerPiCodingAgentMock();
@@ -373,6 +376,18 @@ async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 		},
 	}));
 
+	mock.module("./compact-client-v2", () => ({
+		executeV2Compaction: async (args: Record<string, unknown>) => {
+			v2CompactCalls.push(args);
+			return (
+				options.v2CompactResult ?? {
+					ok: false,
+					reason: "no-compaction-output",
+				}
+			);
+		},
+	}));
+
 	const handlers = new Map<string, HookHandler>();
 	const { default: extension } = await import(`./extension-runtime.ts?test=${crypto.randomUUID()}`);
 	extension({
@@ -391,6 +406,7 @@ async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 		sessionBeforeCompact,
 		beforeProviderRequest,
 		compactCalls,
+		v2CompactCalls,
 		fallbackCalls,
 	};
 }
@@ -407,6 +423,7 @@ test("manual /compact preserves tool/result ordering + assistant phases and pers
 		{ type: "message", role: "assistant", status: "completed", id: "cmp_1", phase: "commentary", content: [] },
 	];
 	const { sessionBeforeCompact, compactCalls } = await loadHookHarness({
+		config: { compactionVersion: "v1" },
 		compactResult: {
 			ok: true,
 			status: 200,
@@ -481,7 +498,9 @@ test("manual /compact preserves tool/result ordering + assistant phases and pers
 });
 
 test("first native compaction sends the full current session context, including Pi's kept recent window", async () => {
-	const { sessionBeforeCompact, compactCalls } = await loadHookHarness();
+	const { sessionBeforeCompact, compactCalls } = await loadHookHarness({
+		config: { compactionVersion: "v1" },
+	});
 	const model = { ...defaultModel };
 	const summarizedUser = createUserEntry("summarized_user", "Older context slated for summarization.");
 	const keptUser = createUserEntry("kept_recent_user", "Recent kept window context that must also be compacted.");
@@ -514,7 +533,9 @@ test("first native compaction sends the full current session context, including 
 });
 
 test("repeated native compaction reuses the latest stored compacted window instead of Pi's shim summary", async () => {
-	const { sessionBeforeCompact, compactCalls } = await loadHookHarness();
+	const { sessionBeforeCompact, compactCalls } = await loadHookHarness({
+		config: { compactionVersion: "v1" },
+	});
 	const model = { ...defaultModel };
 	const oldKeptUser = createUserEntry("old_kept_user", "Original context before native compaction.");
 	const compactedWindow = [
@@ -624,7 +645,7 @@ test("session_before_compact falls through to the configured-model fallback when
 
 test("continuity-break opt-in restarts native compaction from Pi's current session context", async () => {
 	const { sessionBeforeCompact, compactCalls, fallbackCalls } = await loadHookHarness({
-		config: { allowCompactionContinuityBreak: true },
+		config: { compactionVersion: "v1", allowCompactionContinuityBreak: true },
 	});
 	const model = { ...defaultModel };
 	const olderUser = createUserEntry("older_recovery_user", "Context retained by Pi after its earlier compaction.");
@@ -975,8 +996,8 @@ test("responses compact failure falls back to the configured native model and re
 		tokensBefore: 512,
 		details: { readFiles: ["src/extension-runtime.ts"], modifiedFiles: [] },
 	};
-	const { sessionBeforeCompact, compactCalls, fallbackCalls } = await loadHookHarness({
-		compactResult: { ok: false, reason: "non-2xx", status: 404 },
+	const { sessionBeforeCompact, v2CompactCalls, compactCalls, fallbackCalls } = await loadHookHarness({
+		v2CompactResult: { ok: false, reason: "non-2xx", status: 404 },
 		nativeFallbackResult: {
 			ok: true,
 			result: fallbackResult,
@@ -1007,8 +1028,9 @@ test("responses compact failure falls back to the configured native model and re
 		}),
 	)) as { compaction: Record<string, unknown> };
 
-	// The responses compact endpoint was attempted once, then the fallback took over.
-	expect(compactCalls).toHaveLength(1);
+	// V2 was attempted and failed; V1 was never tried; fallback took over.
+	expect(v2CompactCalls).toHaveLength(1);
+	expect(compactCalls).toHaveLength(0);
 	expect(fallbackCalls).toHaveLength(1);
 	expect(result.compaction).toEqual(fallbackResult);
 });
@@ -1076,6 +1098,7 @@ test("responses compact stores the extracted assistant summary text as the entry
 		},
 	];
 	const { sessionBeforeCompact } = await loadHookHarness({
+		config: { compactionVersion: "v1" },
 		compactResult: {
 			ok: true,
 			status: 200,
@@ -1106,4 +1129,177 @@ test("responses compact stores the extracted assistant summary text as the entry
 	)) as { compaction: Record<string, unknown> };
 
 	expect(result.compaction.summary).toBe("Compaction covered the auth refactor.");
+});
+
+// ── V2 decision path tests ────────────────────────────────────────────
+
+test("V2 compaction success returns compactedWindow with retained messages + blob", async () => {
+	const { sessionBeforeCompact, v2CompactCalls, compactCalls } = await loadHookHarness({
+		v2CompactResult: {
+			ok: true,
+			compactionItem: { type: "compaction", id: "cmp_v2", encrypted_content: "encrypted-blob" },
+			responseId: "resp_v2_success",
+			createdAt: nextTimestamp(),
+			usage: { input_tokens: 5000, output_tokens: 100, total_tokens: 5100 },
+		},
+		// compactionVersion defaults to "v2" so V2 path is taken
+	});
+	const model = { ...defaultModel };
+	const user = createUserEntry("v2_user", "Context for V2 compaction.");
+	const event = {
+		signal: new AbortController().signal,
+		customInstructions: undefined,
+		preparation: {
+			tokensBefore: 512,
+			firstKeptEntryId: user.id,
+			previousSummary: undefined,
+			messagesToSummarize: [toReplayMessage(user)],
+			turnPrefixMessages: [],
+		},
+	};
+
+	const result = (await sessionBeforeCompact(
+		event,
+		createContext({
+			model,
+			systemPrompt: "V2 test instructions",
+			sessionContextMessages: [toReplayMessage(user)],
+		}),
+	)) as { compaction: Record<string, unknown> };
+
+	// V2 was attempted and succeeded — V1 was never called.
+	expect(v2CompactCalls).toHaveLength(1);
+	expect(compactCalls).toHaveLength(0);
+	expect(result.compaction.summary).toBe(NATIVE_COMPACTION_FALLBACK_SUMMARY);
+	expect(result.compaction.firstKeptEntryId).toBe(user.id);
+
+	const details = result.compaction.details as {
+		strategy: string;
+		compactedWindow: unknown[];
+	};
+	expect(details.strategy).toBe("openai-native-compact-v2");
+	// compactedWindow should contain retained messages + the compaction blob
+	const lastItem = details.compactedWindow[details.compactedWindow.length - 1] as Record<string, unknown>;
+	expect(lastItem.type).toBe("compaction");
+	expect(lastItem.encrypted_content).toBe("encrypted-blob");
+});
+
+test("V2 failure falls through to configured-model fallback", async () => {
+	const fallbackResult = {
+		summary: "## Fallback summary after V2 failure.",
+		firstKeptEntryId: "v2_fallback_user",
+		tokensBefore: 512,
+		details: { readFiles: [], modifiedFiles: [] },
+	};
+	const { sessionBeforeCompact, v2CompactCalls, compactCalls, fallbackCalls } = await loadHookHarness({
+		v2CompactResult: {
+			ok: false,
+			reason: "no-compaction-output",
+		},
+		nativeFallbackResult: {
+			ok: true,
+			result: fallbackResult,
+			model: { provider: "google", id: "gemini-2.5-flash" },
+		},
+		config: { compactionModel: "google/gemini-2.5-flash" },
+	});
+	const model = { ...defaultModel };
+	const user = createUserEntry("v2_fallback_user", "Context for V2 fallback.");
+	const event = {
+		signal: new AbortController().signal,
+		customInstructions: undefined,
+		preparation: {
+			tokensBefore: 512,
+			firstKeptEntryId: user.id,
+			previousSummary: undefined,
+			messagesToSummarize: [toReplayMessage(user)],
+			turnPrefixMessages: [],
+		},
+	};
+
+	const result = (await sessionBeforeCompact(
+		event,
+		createContext({
+			model,
+			systemPrompt: "V2 fallback test",
+			sessionContextMessages: [toReplayMessage(user)],
+		}),
+	)) as { compaction: Record<string, unknown> };
+
+	// V2 was attempted and failed — V1 was never tried — fallback took over.
+	expect(v2CompactCalls).toHaveLength(1);
+	expect(compactCalls).toHaveLength(0);
+	expect(fallbackCalls).toHaveLength(1);
+	expect(result.compaction).toEqual(fallbackResult);
+});
+
+test("compactionVersion=v1 skips V2 entirely", async () => {
+	const { sessionBeforeCompact, v2CompactCalls, compactCalls } = await loadHookHarness({
+		config: { compactionVersion: "v1" },
+	});
+	const model = { ...defaultModel };
+	const user = createUserEntry("v1_only_user", "Context for V1-only mode.");
+	const event = {
+		signal: new AbortController().signal,
+		customInstructions: undefined,
+		preparation: {
+			tokensBefore: 512,
+			firstKeptEntryId: user.id,
+			previousSummary: undefined,
+			messagesToSummarize: [toReplayMessage(user)],
+			turnPrefixMessages: [],
+		},
+	};
+
+	const result = (await sessionBeforeCompact(
+		event,
+		createContext({
+			model,
+			systemPrompt: "V1 only test",
+			sessionContextMessages: [toReplayMessage(user)],
+		}),
+	)) as { compaction: Record<string, unknown> };
+
+	// V2 was never attempted; V1 ran directly.
+	expect(v2CompactCalls).toHaveLength(0);
+	expect(compactCalls).toHaveLength(1);
+	const details = result.compaction.details as { strategy: string };
+	expect(details.strategy).toBe("openai-native-compact-v1");
+});
+
+test("V2 abort cancels without fallback", async () => {
+	const { sessionBeforeCompact, v2CompactCalls, compactCalls, fallbackCalls } = await loadHookHarness({
+		v2CompactResult: {
+			ok: false,
+			reason: "aborted",
+		},
+	});
+	const model = { ...defaultModel };
+	const user = createUserEntry("v2_abort_user", "Context for V2 abort.");
+	const event = {
+		signal: new AbortController().signal,
+		customInstructions: undefined,
+		preparation: {
+			tokensBefore: 512,
+			firstKeptEntryId: user.id,
+			previousSummary: undefined,
+			messagesToSummarize: [toReplayMessage(user)],
+			turnPrefixMessages: [],
+		},
+	};
+
+	const result = await sessionBeforeCompact(
+		event,
+		createContext({
+			model,
+			systemPrompt: "V2 abort test",
+			sessionContextMessages: [toReplayMessage(user)],
+		}),
+	) as { cancel?: boolean };
+
+	// V2 was attempted, returned aborted — should cancel, not fall through.
+	expect(v2CompactCalls).toHaveLength(1);
+	expect(compactCalls).toHaveLength(0);
+	expect(fallbackCalls).toHaveLength(0);
+	expect(result.cancel).toBe(true);
 });

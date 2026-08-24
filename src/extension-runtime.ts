@@ -6,6 +6,7 @@ import type {
 	SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 import { executeNativeCompaction } from "./compact-client";
+import { executeV2Compaction } from "./compact-client-v2";
 import { loadExtensionConfig } from "./config";
 import { writeDebugArtifact } from "./debug";
 import { resolveLatestNativeCompactionEntry } from "./details-store";
@@ -15,6 +16,7 @@ import {
 	serializeLiveTailToResponsesInput,
 } from "./payload-rewrite";
 import { getCompactionRequestExtras, rememberRequestContext } from "./request-context-cache";
+import { buildRetainedMessages } from "./retained-messages";
 import {
 	isResponsesCompatiblePayload,
 	resolveNativeCompactionEnvironment,
@@ -26,6 +28,8 @@ import {
 	createNativeCompactionResult,
 	EXTENSION_ID,
 	isNativeCompactionDetails,
+	NATIVE_COMPACTION_STRATEGY,
+	NATIVE_COMPACTION_STRATEGY_V2,
 	type ExtensionConfig,
 	type NativeCompactionDetails,
 	type NativeCompactionRequestMeta,
@@ -90,7 +94,7 @@ function buildCompactionInstructions(systemPrompt: string, customInstructions?: 
 	return `${systemPrompt}\n\nAdditional user guidance for this manual /compact request:\n${guidance}`;
 }
 
-async function runResponsesNativeCompact(
+async function runResponsesV1Compact(
 	event: SessionBeforeCompactEvent,
 	ctx: ExtensionContext,
 	config: ExtensionConfig,
@@ -135,7 +139,7 @@ async function runResponsesNativeCompact(
 		writeDebugArtifact(
 			"compaction-event",
 			{
-				event: "session_before_compact.responses-compact-skip",
+				event: "session_before_compact.v1-compact-skip",
 				reason: latestNativeCompaction.reason,
 				provider: runtime.provider,
 				api: runtime.api,
@@ -169,7 +173,7 @@ async function runResponsesNativeCompact(
 		writeDebugArtifact(
 			"compaction-event",
 			{
-				event: "session_before_compact.responses-compact-failure",
+				event: "session_before_compact.v1-compact-failure",
 				reason: compactResult.reason,
 				status: compactResult.status,
 				errorMessage: compactResult.errorMessage,
@@ -196,7 +200,7 @@ async function runResponsesNativeCompact(
 		writeDebugArtifact(
 			"compaction-event",
 			{
-				event: "session_before_compact.invalid-native-details",
+				event: "session_before_compact.v1-invalid-native-details",
 				reason: error instanceof Error ? error.message : String(error),
 				provider: runtime.provider,
 				api: runtime.api,
@@ -219,7 +223,7 @@ async function runResponsesNativeCompact(
 	writeDebugArtifact(
 		"compaction-event",
 		{
-			event: "session_before_compact.responses-compact-success",
+			event: "session_before_compact.v1-compact-success",
 			provider: runtime.provider,
 			api: runtime.api,
 			model: runtime.model,
@@ -229,6 +233,164 @@ async function runResponsesNativeCompact(
 			compactResponseId: compactResult.compactResponseId,
 			compactedItems: compactResult.compactedWindow.length,
 			summaryExtracted: Boolean(compactResult.summaryText),
+			firstKeptEntryId: event.preparation.firstKeptEntryId,
+		},
+		config,
+		ctx,
+	);
+
+	return { outcome: "success", compaction };
+}
+
+/**
+ * V2 compaction: stream a Responses request with compaction_trigger appended.
+ * On success, returns retained messages + encrypted compaction blob.
+ */
+async function runResponsesV2Compact(
+	event: SessionBeforeCompactEvent,
+	ctx: ExtensionContext,
+	config: ExtensionConfig,
+	runtime: NativeCompactionRuntime,
+): Promise<ResponsesCompactOutcome> {
+	const instructions = buildCompactionInstructions(ctx.getSystemPrompt(), event.customInstructions);
+	const branchEntries = ctx.sessionManager.getBranch();
+	const latestNativeCompaction = resolveLatestNativeCompactionEntry(branchEntries, {
+		provider: runtime.provider,
+		api: runtime.api,
+		model: runtime.model,
+		baseUrl: runtime.baseUrl,
+	});
+
+	let requestSource: "session-context" | "non-native-session-context" | "latest-native-replay";
+	let request: NativeCompactionRequestBody;
+	if (latestNativeCompaction.ok) {
+		const liveTailEntries = branchEntries.slice(latestNativeCompaction.index + 1);
+		requestSource = "latest-native-replay";
+		const input: ResponsesInputItem[] = [
+			...(cloneOpaqueWindow(latestNativeCompaction.entry.details.compactedWindow) as ResponsesInputItem[]),
+			...serializeLiveTailToResponsesInput({ model: runtime.currentModel, entries: liveTailEntries }),
+		];
+		request = {
+			model: runtime.currentModel.id,
+			input,
+			instructions,
+		};
+	} else if (
+		latestNativeCompaction.reason === "no-compaction" ||
+		(latestNativeCompaction.reason === "latest-compaction-not-native" &&
+			config.allowCompactionContinuityBreak)
+	) {
+		requestSource =
+			latestNativeCompaction.reason === "no-compaction" ? "session-context" : "non-native-session-context";
+		request = serializeMessagesToCompactRequest({
+			model: runtime.currentModel,
+			messages: ctx.sessionManager.buildSessionContext().messages,
+			instructions,
+		});
+	} else {
+		writeDebugArtifact(
+			"compaction-event",
+			{
+				event: "session_before_compact.v2-compact-skip",
+				reason: latestNativeCompaction.reason,
+				provider: runtime.provider,
+				api: runtime.api,
+				model: runtime.model,
+				baseUrl: runtime.baseUrl,
+				latestCompactionIndex: latestNativeCompaction.latestCompactionIndex,
+				latestCompactionIdentity: getCompactionIdentityDebugInfo(latestNativeCompaction.latestCompaction),
+			},
+			config,
+			ctx,
+		);
+		return { outcome: "failed" };
+	}
+
+	const extras = getCompactionRequestExtras(runtime.model, getSessionId(ctx));
+	if (extras) {
+		request = { ...request, ...extras };
+	}
+
+	const v2Result = await executeV2Compaction({
+		runtime,
+		request,
+		signal: event.signal,
+		settings: config,
+		context: ctx,
+	});
+
+	if (!v2Result.ok) {
+		writeDebugArtifact(
+			"compaction-event",
+			{
+				event: "session_before_compact.v2-compact-failure",
+				reason: v2Result.reason,
+				status: v2Result.status,
+				errorMessage: v2Result.errorMessage,
+			},
+			config,
+			ctx,
+		);
+		return v2Result.reason === "aborted" ? { outcome: "aborted" } : { outcome: "failed" };
+	}
+
+	// Build compacted window: retained messages + compaction blob.
+	const retainedMessages = buildRetainedMessages(request.input);
+	const compactedWindow = [...retainedMessages, v2Result.compactionItem];
+
+	let details: NativeCompactionDetails;
+	try {
+		details = createNativeCompactionDetails(
+			{
+				provider: runtime.provider,
+				api: runtime.api,
+				model: runtime.model,
+				baseUrl: runtime.baseUrl,
+				compactedWindow,
+				compactResponseId: v2Result.responseId,
+				createdAt: v2Result.createdAt,
+				requestMeta: buildCompactionRequestMeta(event),
+			},
+			NATIVE_COMPACTION_STRATEGY_V2,
+		);
+	} catch (error) {
+		writeDebugArtifact(
+			"compaction-event",
+			{
+				event: "session_before_compact.v2-invalid-native-details",
+				reason: error instanceof Error ? error.message : String(error),
+				provider: runtime.provider,
+				api: runtime.api,
+				model: runtime.model,
+				baseUrl: runtime.baseUrl,
+			},
+			config,
+			ctx,
+		);
+		return { outcome: "failed" };
+	}
+
+	// V2 blob is encrypted; no summary text can be extracted.
+	const compaction = createNativeCompactionResult({
+		firstKeptEntryId: event.preparation.firstKeptEntryId,
+		tokensBefore: event.preparation.tokensBefore,
+		details,
+	});
+
+	writeDebugArtifact(
+		"compaction-event",
+		{
+			event: "session_before_compact.v2-compact-success",
+			provider: runtime.provider,
+			api: runtime.api,
+			model: runtime.model,
+			requestSource,
+			requestInputItems: request.input.length,
+			requestExtras: extras ? Object.keys(extras) : [],
+			compactResponseId: v2Result.responseId,
+			retainedMessageCount: retainedMessages.length,
+			compactedItems: compactedWindow.length,
+			usage: v2Result.usage,
 			firstKeptEntryId: event.preparation.firstKeptEntryId,
 		},
 		config,
@@ -271,7 +433,14 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx:
 		responsesCompactApis: config.responsesCompactApis,
 	});
 	if (resolution.ok) {
-		const responsesOutcome = await runResponsesNativeCompact(event, ctx, config, resolution.runtime);
+		let responsesOutcome: ResponsesCompactOutcome;
+
+		if (config.compactionVersion === "v2") {
+			responsesOutcome = await runResponsesV2Compact(event, ctx, config, resolution.runtime);
+		} else {
+			responsesOutcome = await runResponsesV1Compact(event, ctx, config, resolution.runtime);
+		}
+
 		if (responsesOutcome.outcome === "success") {
 			return { compaction: responsesOutcome.compaction };
 		}
@@ -296,7 +465,7 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx:
 	}
 
 	// Branch 2: run pi's native compaction method with the configured model.
-	const fallback = await runNativeFallbackCompaction({ ctx, event, config });
+	const fallback = await runNativeFallbackCompaction({ ctx, event, config, sessionId: getSessionId(ctx) });
 	if (fallback.ok) {
 		if (ctx.hasUI) {
 			ctx.ui.notify(
@@ -309,6 +478,7 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx:
 			{
 				event: "session_before_compact.fallback-success",
 				model: fallback.model,
+				usage: fallback.usage,
 			},
 			config,
 			ctx,
@@ -501,4 +671,23 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_before_compact", handleSessionBeforeCompact);
 	pi.on("before_provider_request", handleBeforeProviderRequest);
+
+	pi.on("session_compact_failed", (event, ctx) => {
+		const { config } = loadExtensionConfig();
+		if (!config.enabled) return;
+
+		writeDebugArtifact(
+			"compaction-event",
+			{
+				event: "session_compact_failed",
+				reason: event.reason,
+				errorMessage: event.errorMessage,
+				aborted: event.aborted,
+				willRetry: event.willRetry,
+				fromExtension: event.fromExtension,
+			},
+			config,
+			ctx,
+		);
+	});
 }

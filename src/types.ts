@@ -10,6 +10,7 @@ export const REDACTED_VALUE = "[REDACTED]";
  */
 export const RESPONSES_COMPACT_CAPABLE_APIS = ["openai-responses", "openai-codex-responses"] as const;
 export const NATIVE_COMPACTION_STRATEGY = "openai-native-compact-v1";
+export const NATIVE_COMPACTION_STRATEGY_V2 = "openai-native-compact-v2";
 /** Used as CompactionEntry.summary only when no summary text could be extracted from the compact response. */
 export const NATIVE_COMPACTION_FALLBACK_SUMMARY = "[OpenAI native compaction checkpoint]";
 
@@ -22,6 +23,9 @@ export const THINKING_LEVELS: readonly ThinkingLevel[] = [
 	"xhigh",
 	"max",
 ];
+
+export type CompactionVersion = "v1" | "v2";
+export const COMPACTION_VERSIONS: readonly CompactionVersion[] = ["v1", "v2"];
 
 export type DebugArtifactKind =
 	| "provider-request"
@@ -45,6 +49,13 @@ export type ExtensionConfig = {
 	compactionThinkingLevel: ThinkingLevel;
 	/** Subset of RESPONSES_COMPACT_CAPABLE_APIS that should use the compact endpoint. */
 	responsesCompactApis: string[];
+	/**
+	 * Which compaction protocol to use for Responses-family APIs.
+	 * - "v2" (default): streaming CompactionTrigger via /responses endpoint.
+	 * - "v1": POST /responses/compact endpoint.
+	 * V2 failures automatically fall back to V1.
+	 */
+	compactionVersion: CompactionVersion;
 	notifyOnLoad: boolean;
 	debug: boolean;
 	logProviderPayloads: boolean;
@@ -97,6 +108,7 @@ export type RedactOptions = {
 };
 
 export type NativeCompactionStrategy = typeof NATIVE_COMPACTION_STRATEGY;
+export type NativeCompactionStrategyV2 = typeof NATIVE_COMPACTION_STRATEGY_V2;
 
 export type NativeCompactionRequestMeta = {
 	tokensBefore?: number;
@@ -111,7 +123,7 @@ export type NativeCompactionIdentity = {
 };
 
 export type NativeCompactionDetails = NativeCompactionIdentity & {
-	strategy: NativeCompactionStrategy;
+	strategy: NativeCompactionStrategy | NativeCompactionStrategyV2;
 	compactedWindow: unknown[];
 	compactResponseId?: string;
 	createdAt: string;
@@ -240,7 +252,7 @@ export function isNativeCompactionDetails(value: unknown): value is NativeCompac
 	}
 
 	return (
-		value.strategy === NATIVE_COMPACTION_STRATEGY &&
+		(value.strategy === NATIVE_COMPACTION_STRATEGY || value.strategy === NATIVE_COMPACTION_STRATEGY_V2) &&
 		isNativeCompactionIdentity(value) &&
 		Array.isArray(value.compactedWindow) &&
 		value.compactedWindow.every(isCompactedWindowItem) &&
@@ -254,9 +266,12 @@ export function isNativeCompactionEntry(value: unknown): value is NativeCompacti
 	return isRecord(value) && value.type === "compaction" && isNativeCompactionDetails(value.details);
 }
 
-export function createNativeCompactionDetails(input: CreateNativeCompactionDetailsInput): NativeCompactionDetails {
+export function createNativeCompactionDetails(
+	input: CreateNativeCompactionDetailsInput,
+	strategy: NativeCompactionStrategy | NativeCompactionStrategyV2 = NATIVE_COMPACTION_STRATEGY,
+): NativeCompactionDetails {
 	return {
-		strategy: NATIVE_COMPACTION_STRATEGY,
+		strategy,
 		provider: normalizeString(input.provider),
 		api: normalizeString(input.api),
 		model: normalizeString(input.model),
@@ -293,6 +308,7 @@ export const DEFAULT_EXTENSION_CONFIG: ExtensionConfig = {
 	compactionModel: undefined,
 	compactionThinkingLevel: "off",
 	responsesCompactApis: [...RESPONSES_COMPACT_CAPABLE_APIS],
+	compactionVersion: "v2",
 	notifyOnLoad: false,
 	debug: false,
 	logProviderPayloads: false,

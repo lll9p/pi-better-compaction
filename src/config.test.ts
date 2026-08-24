@@ -94,6 +94,32 @@ describe("loadExtensionConfig", () => {
 		expect(loaded.warnings.length).toBe(6);
 	});
 
+	test("compactionVersion accepts v1 and v2", () => {
+		const v1Path = writeTempConfig(JSON.stringify({ compactionVersion: "v1" }));
+		const v1 = loadExtensionConfig(v1Path);
+		expect(v1.config.compactionVersion).toBe("v1");
+		expect(v1.warnings).toEqual([]);
+
+		const v2Path = writeTempConfig(JSON.stringify({ compactionVersion: "v2" }));
+		const v2 = loadExtensionConfig(v2Path);
+		expect(v2.config.compactionVersion).toBe("v2");
+		expect(v2.warnings).toEqual([]);
+	});
+
+	test("invalid compactionVersion warns and keeps default", () => {
+		const configPath = writeTempConfig(JSON.stringify({ compactionVersion: "v3" }));
+		const loaded = loadExtensionConfig(configPath);
+		expect(loaded.config.compactionVersion).toBe("v2"); // default
+		expect(loaded.warnings.length).toBe(1);
+		expect(loaded.warnings[0]).toContain("compactionVersion");
+	});
+
+	test("missing compactionVersion defaults to v2", () => {
+		const configPath = writeTempConfig(JSON.stringify({ debug: true }));
+		const loaded = loadExtensionConfig(configPath);
+		expect(loaded.config.compactionVersion).toBe("v2");
+	});
+
 	test("malformed JSON warns and yields defaults", () => {
 		const configPath = writeTempConfig("{ not json");
 		const loaded = loadExtensionConfig(configPath);

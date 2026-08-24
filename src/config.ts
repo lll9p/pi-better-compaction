@@ -3,10 +3,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
+	COMPACTION_VERSIONS,
 	DEFAULT_EXTENSION_CONFIG,
 	EXTENSION_ID,
 	RESPONSES_COMPACT_CAPABLE_APIS,
 	THINKING_LEVELS,
+	type CompactionVersion,
 	type ExtensionConfig,
 	type LoadedExtensionConfig,
 } from "./types";
@@ -78,6 +80,15 @@ function toThinkingLevel(value: unknown, fieldPath: string, warnings: string[]):
 	return undefined;
 }
 
+function toCompactionVersion(value: unknown, fieldPath: string, warnings: string[]): CompactionVersion | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value === "string" && (COMPACTION_VERSIONS as readonly string[]).includes(value)) {
+		return value as CompactionVersion;
+	}
+	warnings.push(`Ignoring ${fieldPath}: expected one of ${COMPACTION_VERSIONS.join(", ")}.`);
+	return undefined;
+}
+
 function toResponsesCompactApis(value: unknown, fieldPath: string, warnings: string[]): string[] | undefined {
 	if (value === undefined) return undefined;
 	if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
@@ -142,6 +153,10 @@ export function loadExtensionConfig(configPath: string = CONFIG_PATH): LoadedExt
 		if (apis !== undefined) {
 			resolved.responsesCompactApis = apis;
 		}
+
+		resolved.compactionVersion =
+			toCompactionVersion(raw.compactionVersion, "compactionVersion", warnings) ??
+			resolved.compactionVersion;
 
 		if (typeof raw.artifactRoot === "string" && raw.artifactRoot.trim().length > 0) {
 			resolved.artifactRoot = raw.artifactRoot.trim();
