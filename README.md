@@ -2,10 +2,11 @@
 
 English | [中文](README.zh-CN.md)
 
-A [pi](https://github.com/nicepkg/pi) extension that upgrades context compaction with two coordinated strategies:
+A [pi](https://github.com/nicepkg/pi) extension that upgrades context compaction with three coordinated strategies:
 
-1. **OpenAI Responses APIs** use the provider's native compaction endpoint, preserving opaque context that plain text summaries lose.
-2. **All other APIs** (Anthropic, Gemini, etc.) can run pi's built-in compaction with a **dedicated cheaper/faster model**, so summarization doesn't consume quota on your primary model.
+1. An optional **mid-run guard** aborts an oversized tool loop, waits for `agent_settled`, compacts once, then resumes with a hidden custom message.
+2. **OpenAI Responses APIs** use the provider's native compaction endpoint, preserving opaque context that plain text summaries lose.
+3. **All other APIs** (Anthropic, Gemini, etc.) can run pi's built-in compaction with a **dedicated cheaper/faster model**, so summarization doesn't consume quota on your primary model.
 
 Everything fails open — if any step cannot proceed, pi's default compaction takes over.
 
@@ -44,6 +45,10 @@ If the file doesn't exist, all defaults apply. The extension never creates this 
 ```jsonc
 {
   "enabled": true,
+  "midRun": {
+    "enabled": false,
+    "thresholdPercent": 80
+  },
   "compactionVersion": "v2",
   "compactionModel": null,
   "compactionThinkingLevel": "off",
@@ -65,6 +70,8 @@ If the file doesn't exist, all defaults apply. The extension never creates this 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | `boolean` | `true` | Master switch. Set `false` to disable the extension entirely. |
+| `midRun.enabled` | `boolean` | `false` | Enable the mid-run guard. It may abort a long tool loop once context reaches the configured threshold. |
+| `midRun.thresholdPercent` | `number` | `80` | Context usage percentage that triggers the mid-run guard after a tool-bearing turn. Must be greater than 0 and at most 100. |
 | `compactionVersion` | `"v1" \| "v2"` | `"v2"` | Protocol for Responses-family APIs. **V2** (streaming, encrypted blob) is the current OpenAI default. **V1** uses the legacy `/responses/compact` endpoint. |
 | `compactionModel` | `string \| null` | `null` | Model for fallback compaction (non-Responses APIs, or when native compact fails). Format: `"provider/model-id"`, e.g. `"openai/gpt-5.1-mini"`. `null` = let pi use the current chat model. |
 | `compactionThinkingLevel` | `string` | `"off"` | Thinking level for the fallback compaction model. One of: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. |
@@ -76,6 +83,17 @@ If the file doesn't exist, all defaults apply. The extension never creates this 
 | `logCompactResponses` | `boolean` | `false` | Write compact endpoint request/response artifacts. |
 | `redactSensitiveData` | `boolean` | `true` | Redact secrets in debug artifacts. |
 | `artifactRoot` | `string` | `"~/.pi/agent/artifacts/pi-better-compaction"` | Root directory for debug artifacts. Supports `~/` and relative paths (resolved against config dir). |
+
+### Example: enable mid-run compaction
+
+```json
+{
+  "midRun": {
+    "enabled": true,
+    "thresholdPercent": 80
+  }
+}
+```
 
 ### Example: use a cheap model for fallback compaction
 
@@ -95,6 +113,8 @@ If the file doesn't exist, all defaults apply. The extension never creates this 
 ```
 
 ## How it works
+
+With `midRun.enabled`, a completed tool-bearing `turn_end` above the threshold only calls `ctx.abort()`. After Pi emits `agent_settled`, the guard reuses any compaction Pi already completed during abort handling; otherwise it calls `ctx.compact()` exactly once. A successful or coalesced compaction triggers the next turn with a hidden custom message. Failed compaction does not resume, preventing a compact-fail-resume loop.
 
 When pi triggers compaction (`session_before_compact`):
 

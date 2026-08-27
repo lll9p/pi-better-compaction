@@ -60,6 +60,15 @@ function toBoolean(value: unknown, fieldPath: string, warnings: string[]): boole
 	return undefined;
 }
 
+function toThresholdPercent(value: unknown, fieldPath: string, warnings: string[]): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 100) {
+		return value;
+	}
+	warnings.push(`Ignoring ${fieldPath}: expected a number greater than 0 and at most 100.`);
+	return undefined;
+}
+
 function toModelSpec(value: unknown, fieldPath: string, warnings: string[]): string | null | undefined {
 	if (value === undefined) return undefined;
 	// Explicit null clears a spec, matching the documented "unset = current model" behavior.
@@ -119,6 +128,7 @@ export function loadExtensionConfig(configPath: string = CONFIG_PATH): LoadedExt
 	const warnings: string[] = [];
 	const resolved: ExtensionConfig = {
 		...DEFAULT_EXTENSION_CONFIG,
+		midRun: { ...DEFAULT_EXTENSION_CONFIG.midRun },
 		responsesCompactApis: [...DEFAULT_EXTENSION_CONFIG.responsesCompactApis],
 	};
 	let source: string | undefined;
@@ -128,6 +138,19 @@ export function loadExtensionConfig(configPath: string = CONFIG_PATH): LoadedExt
 		source = configPath;
 
 		resolved.enabled = toBoolean(raw.enabled, "enabled", warnings) ?? resolved.enabled;
+
+		if (raw.midRun === undefined) {
+			// Keep defaults.
+		} else if (isRecord(raw.midRun)) {
+			resolved.midRun.enabled =
+				toBoolean(raw.midRun.enabled, "midRun.enabled", warnings) ?? resolved.midRun.enabled;
+			resolved.midRun.thresholdPercent =
+				toThresholdPercent(raw.midRun.thresholdPercent, "midRun.thresholdPercent", warnings) ??
+				resolved.midRun.thresholdPercent;
+		} else {
+			warnings.push("Ignoring midRun: expected a JSON object.");
+		}
+
 		resolved.allowCompactionContinuityBreak =
 			toBoolean(raw.allowCompactionContinuityBreak, "allowCompactionContinuityBreak", warnings) ??
 			resolved.allowCompactionContinuityBreak;

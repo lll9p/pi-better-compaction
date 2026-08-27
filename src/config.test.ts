@@ -30,6 +30,7 @@ describe("loadExtensionConfig", () => {
 		expect(loaded.source).toBeUndefined();
 		expect(loaded.warnings).toEqual([]);
 		expect(loaded.config.enabled).toBe(true);
+		expect(loaded.config.midRun).toEqual({ enabled: false, thresholdPercent: 80 });
 		expect(loaded.config.allowCompactionContinuityBreak).toBe(false);
 		expect(loaded.config.compactionModel).toBeUndefined();
 		expect(loaded.config.compactionThinkingLevel).toBe("off");
@@ -41,6 +42,7 @@ describe("loadExtensionConfig", () => {
 			JSON.stringify({
 				enabled: true,
 				allowCompactionContinuityBreak: true,
+				midRun: { enabled: true, thresholdPercent: 82.5 },
 				compactionModel: " google/gemini-2.5-flash ",
 				compactionThinkingLevel: "medium",
 				responsesCompactApis: ["openai-responses"],
@@ -55,12 +57,33 @@ describe("loadExtensionConfig", () => {
 		expect(loaded.source).toBe(configPath);
 		expect(loaded.warnings).toEqual([]);
 		expect(loaded.config.allowCompactionContinuityBreak).toBe(true);
+		expect(loaded.config.midRun).toEqual({ enabled: true, thresholdPercent: 82.5 });
 		expect(loaded.config.compactionModel).toBe("google/gemini-2.5-flash");
 		expect(loaded.config.compactionThinkingLevel).toBe("medium");
 		expect(loaded.config.responsesCompactApis).toEqual(["openai-responses"]);
 		expect(loaded.config.debug).toBe(true);
 		expect(loaded.config.notifyOnLoad).toBe(true);
 		expect(loaded.config.artifactRoot).toBe(path.join(os.homedir(), "artifacts/pbc"));
+	});
+
+	test("invalid midRun fields warn and keep defaults", () => {
+		const configPath = writeTempConfig(
+			JSON.stringify({ midRun: { enabled: "yes", thresholdPercent: 0 } }),
+		);
+		const loaded = loadExtensionConfig(configPath);
+
+		expect(loaded.config.midRun).toEqual({ enabled: false, thresholdPercent: 80 });
+		expect(loaded.warnings).toHaveLength(2);
+		expect(loaded.warnings[0]).toContain("midRun.enabled");
+		expect(loaded.warnings[1]).toContain("midRun.thresholdPercent");
+	});
+
+	test("non-object midRun warns and keeps defaults", () => {
+		const configPath = writeTempConfig(JSON.stringify({ midRun: true }));
+		const loaded = loadExtensionConfig(configPath);
+
+		expect(loaded.config.midRun).toEqual({ enabled: false, thresholdPercent: 80 });
+		expect(loaded.warnings).toEqual(["Ignoring midRun: expected a JSON object."]);
 	});
 
 	test("compactionModel null clears the spec", () => {

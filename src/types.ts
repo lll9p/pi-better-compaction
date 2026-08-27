@@ -33,8 +33,14 @@ export type DebugArtifactKind =
 	| "compaction-event"
 	| "lifecycle";
 
+export type MidRunConfig = {
+	enabled: boolean;
+	thresholdPercent: number;
+};
+
 export type ExtensionConfig = {
 	enabled: boolean;
+	midRun: MidRunConfig;
 	/**
 	 * Allow a Responses session whose latest compaction was not created by this extension
 	 * to restart native compaction from Pi's current serialized session context.
@@ -304,6 +310,10 @@ export function createNativeCompactionResult(
 
 export const DEFAULT_EXTENSION_CONFIG: ExtensionConfig = {
 	enabled: true,
+	midRun: {
+		enabled: false,
+		thresholdPercent: 80,
+	},
 	allowCompactionContinuityBreak: false,
 	compactionModel: undefined,
 	compactionThinkingLevel: "off",

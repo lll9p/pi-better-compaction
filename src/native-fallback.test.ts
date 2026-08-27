@@ -1,16 +1,9 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
+import { parseModelSpec, runNativeFallbackCompaction } from "./native-fallback";
 import { DEFAULT_EXTENSION_CONFIG, type ExtensionConfig } from "./types";
 
-let importCounter = 0;
-
 async function loadNativeFallbackModule() {
-	mock.module("@earendil-works/pi-coding-agent", () => ({
-		compact: async () => {
-			throw new Error("unexpected call to pi's real compact()");
-		},
-		convertToLlm: (messages: unknown[]) => messages,
-	}));
-	return import(`./native-fallback.ts?nf=${importCounter++}`);
+	return { parseModelSpec, runNativeFallbackCompaction };
 }
 
 type FakeModel = {
@@ -63,10 +56,6 @@ function createConfig(overrides: Partial<ExtensionConfig> = {}): ExtensionConfig
 		...overrides,
 	};
 }
-
-afterEach(() => {
-	mock.restore();
-});
 
 describe("parseModelSpec", () => {
 	test("splits on the first slash so model ids may contain slashes", async () => {

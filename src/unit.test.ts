@@ -1,6 +1,10 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { executeNativeCompaction, extractCompactedSummaryText } from "./compact-client";
 import { buildCompactUrl } from "./runtime";
+import {
+	serializeMessagesToCompactRequest,
+	serializeMessagesToResponsesInput,
+} from "./serializer";
 
 const baseModel = {
 	provider: "openai",
@@ -15,15 +19,6 @@ const baseModel = {
 	maxTokens: 1000,
 };
 
-let serializerImportCounter = 0;
-
-async function loadSerializerModule() {
-	mock.module("@earendil-works/pi-coding-agent", () => ({
-		convertToLlm: (messages: unknown[]) => messages,
-	}));
-	return import(`./serializer.ts?unit=${serializerImportCounter++}`);
-}
-
 function createJwtWithAccountId(accountId: string): string {
 	const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
 	const payload = Buffer.from(
@@ -37,7 +32,6 @@ function createJwtWithAccountId(accountId: string): string {
 }
 
 afterEach(() => {
-	serializerImportCounter = 0;
 	mock.restore();
 });
 
@@ -109,7 +103,6 @@ test("executeNativeCompaction propagates resolved request headers and codex auth
 });
 
 test("serializer sanitizes unpaired surrogates in instructions and message content", async () => {
-	const { serializeMessagesToCompactRequest, serializeMessagesToResponsesInput } = await loadSerializerModule();
 	const invalid = "\ud800Hello\udc00";
 	const request = serializeMessagesToCompactRequest({
 		model: baseModel as never,

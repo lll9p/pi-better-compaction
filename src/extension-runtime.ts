@@ -10,6 +10,7 @@ import { executeV2Compaction } from "./compact-client-v2";
 import { loadExtensionConfig } from "./config";
 import { writeDebugArtifact } from "./debug";
 import { resolveLatestNativeCompactionEntry } from "./details-store";
+import { registerMidRunGuard } from "./midrun";
 import { runNativeFallbackCompaction } from "./native-fallback";
 import {
 	rewriteResponsesPayloadWithNativeReplay,
@@ -39,6 +40,20 @@ type ResponsesCompactOutcome =
 	| { outcome: "success"; compaction: CompactionResult<NativeCompactionDetails> }
 	| { outcome: "aborted" }
 	| { outcome: "failed" };
+
+export type ExtensionRuntimeDependencies = {
+	loadExtensionConfig: typeof loadExtensionConfig;
+	executeNativeCompaction: typeof executeNativeCompaction;
+	executeV2Compaction: typeof executeV2Compaction;
+	runNativeFallbackCompaction: typeof runNativeFallbackCompaction;
+};
+
+const DEFAULT_DEPENDENCIES: ExtensionRuntimeDependencies = {
+	loadExtensionConfig,
+	executeNativeCompaction,
+	executeV2Compaction,
+	runNativeFallbackCompaction,
+};
 
 function buildCompactionRequestMeta(event: SessionBeforeCompactEvent): NativeCompactionRequestMeta {
 	return {
@@ -91,7 +106,7 @@ function buildCompactionInstructions(systemPrompt: string, customInstructions?: 
 		return systemPrompt;
 	}
 
-	return `${systemPrompt}\n\nAdditional user guidance for this manual /compact request:\n${guidance}`;
+	return `${systemPrompt}\n\nAdditional compaction guidance:\n${guidance}`;
 }
 
 async function runResponsesV1Compact(
@@ -99,6 +114,7 @@ async function runResponsesV1Compact(
 	ctx: ExtensionContext,
 	config: ExtensionConfig,
 	runtime: NativeCompactionRuntime,
+	dependencies: ExtensionRuntimeDependencies,
 ): Promise<ResponsesCompactOutcome> {
 	const instructions = buildCompactionInstructions(ctx.getSystemPrompt(), event.customInstructions);
 	const branchEntries = ctx.sessionManager.getBranch();
@@ -161,7 +177,7 @@ async function runResponsesV1Compact(
 		request = { ...request, ...extras };
 	}
 
-	const compactResult = await executeNativeCompaction({
+	const compactResult = await dependencies.executeNativeCompaction({
 		runtime,
 		request,
 		signal: event.signal,
@@ -251,6 +267,7 @@ async function runResponsesV2Compact(
 	ctx: ExtensionContext,
 	config: ExtensionConfig,
 	runtime: NativeCompactionRuntime,
+	dependencies: ExtensionRuntimeDependencies,
 ): Promise<ResponsesCompactOutcome> {
 	const instructions = buildCompactionInstructions(ctx.getSystemPrompt(), event.customInstructions);
 	const branchEntries = ctx.sessionManager.getBranch();
@@ -311,7 +328,7 @@ async function runResponsesV2Compact(
 		request = { ...request, ...extras };
 	}
 
-	const v2Result = await executeV2Compaction({
+	const v2Result = await dependencies.executeV2Compaction({
 		runtime,
 		request,
 		signal: event.signal,
@@ -400,8 +417,12 @@ async function runResponsesV2Compact(
 	return { outcome: "success", compaction };
 }
 
-async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx: ExtensionContext) {
-	const { config } = loadExtensionConfig();
+async function handleSessionBeforeCompact(
+	event: SessionBeforeCompactEvent,
+	ctx: ExtensionContext,
+	dependencies: ExtensionRuntimeDependencies,
+) {
+	const { config } = dependencies.loadExtensionConfig();
 	if (!config.enabled) {
 		return undefined;
 	}
@@ -436,9 +457,9 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx:
 		let responsesOutcome: ResponsesCompactOutcome;
 
 		if (config.compactionVersion === "v2") {
-			responsesOutcome = await runResponsesV2Compact(event, ctx, config, resolution.runtime);
+			responsesOutcome = await runResponsesV2Compact(event, ctx, config, resolution.runtime, dependencies);
 		} else {
-			responsesOutcome = await runResponsesV1Compact(event, ctx, config, resolution.runtime);
+			responsesOutcome = await runResponsesV1Compact(event, ctx, config, resolution.runtime, dependencies);
 		}
 
 		if (responsesOutcome.outcome === "success") {
@@ -465,7 +486,12 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx:
 	}
 
 	// Branch 2: run pi's native compaction method with the configured model.
-	const fallback = await runNativeFallbackCompaction({ ctx, event, config, sessionId: getSessionId(ctx) });
+	const fallback = await dependencies.runNativeFallbackCompaction({
+		ctx,
+		event,
+		config,
+		sessionId: getSessionId(ctx),
+	});
 	if (fallback.ok) {
 		if (ctx.hasUI) {
 			ctx.ui.notify(
@@ -514,8 +540,12 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx:
 	return undefined;
 }
 
-async function handleBeforeProviderRequest(event: BeforeProviderRequestEvent, ctx: ExtensionContext) {
-	const { config } = loadExtensionConfig();
+async function handleBeforeProviderRequest(
+	event: BeforeProviderRequestEvent,
+	ctx: ExtensionContext,
+	dependencies: ExtensionRuntimeDependencies,
+) {
+	const { config } = dependencies.loadExtensionConfig();
 	if (!config.enabled) {
 		return undefined;
 	}
@@ -638,9 +668,14 @@ async function handleBeforeProviderRequest(event: BeforeProviderRequestEvent, ct
 	return rewrite.rewrittenPayload;
 }
 
-export default function (pi: ExtensionAPI) {
+export function registerExtensionRuntime(
+	pi: ExtensionAPI,
+	dependencies: ExtensionRuntimeDependencies = DEFAULT_DEPENDENCIES,
+): void {
+	registerMidRunGuard(pi, dependencies.loadExtensionConfig);
+
 	pi.on("session_start", (_event, ctx) => {
-		const { config, source, warnings } = loadExtensionConfig();
+		const { config, source, warnings } = dependencies.loadExtensionConfig();
 		if (!config.enabled) return;
 
 		if (warnings.length > 0 && ctx.hasUI && config.debug) {
@@ -669,11 +704,15 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_before_compact", handleSessionBeforeCompact);
-	pi.on("before_provider_request", handleBeforeProviderRequest);
+	pi.on("session_before_compact", (event, ctx) =>
+		handleSessionBeforeCompact(event, ctx, dependencies),
+	);
+	pi.on("before_provider_request", (event, ctx) =>
+		handleBeforeProviderRequest(event, ctx, dependencies),
+	);
 
 	pi.on("session_compact_failed", (event, ctx) => {
-		const { config } = loadExtensionConfig();
+		const { config } = dependencies.loadExtensionConfig();
 		if (!config.enabled) return;
 
 		writeDebugArtifact(
@@ -691,3 +730,5 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 }
+
+export default registerExtensionRuntime;

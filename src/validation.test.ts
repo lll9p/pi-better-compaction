@@ -1,5 +1,10 @@
-import { afterEach, expect, mock, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
+import { registerExtensionRuntime } from "./extension-runtime";
 import { clearRequestContextCache } from "./request-context-cache";
+import {
+	createResponsesInputParitySignature,
+	serializeMessagesToResponsesInput,
+} from "./serializer";
 import {
 	DEFAULT_EXTENSION_CONFIG,
 	NATIVE_COMPACTION_FALLBACK_SUMMARY,
@@ -60,51 +65,13 @@ const defaultModel: TestModel = {
 	reasoning: true,
 };
 
-const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:\n\n<summary>\n`;
-const COMPACTION_SUMMARY_SUFFIX = `\n</summary>`;
-
-let serializerImportCounter = 0;
 let timestampCounter = 0;
 
-function registerPiCodingAgentMock(): void {
-	mock.module("@earendil-works/pi-coding-agent", () => ({
-		compact: async () => {
-			throw new Error("unexpected call to pi's real compact() in validation tests");
-		},
-		convertToLlm: (messages: Array<Record<string, unknown>>) =>
-			messages
-				.map((message) => {
-					if (message.role === "compactionSummary") {
-						return {
-							role: "user",
-							content: [
-								{
-									type: "text",
-									text: `${COMPACTION_SUMMARY_PREFIX}${message.summary ?? ""}${COMPACTION_SUMMARY_SUFFIX}`,
-								},
-							],
-							timestamp: message.timestamp,
-						};
-					}
-
-					return message;
-				})
-				.filter(Boolean),
-	}));
-}
-
-async function loadSerializerModule() {
-	registerPiCodingAgentMock();
-	return import(`./serializer.ts?validation=${serializerImportCounter++}`);
-}
-
 async function serializeResponsesInput(model: TestModel, messages: Record<string, unknown>[]): Promise<unknown[]> {
-	const { serializeMessagesToResponsesInput } = await loadSerializerModule();
 	return serializeMessagesToResponsesInput(model as never, messages as never);
 }
 
 async function createInputParitySignature(input: readonly unknown[]): Promise<string[]> {
-	const { createResponsesInputParitySignature } = await loadSerializerModule();
 	return createResponsesInputParitySignature(input);
 }
 
@@ -335,66 +302,55 @@ async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 	const v2CompactCalls: Array<Record<string, unknown>> = [];
 	const fallbackCalls: Array<Record<string, unknown>> = [];
 
-	registerPiCodingAgentMock();
-
-	mock.module("./config", () => ({
-		loadExtensionConfig: () => ({
-			config: {
-				...DEFAULT_EXTENSION_CONFIG,
-				responsesCompactApis: [...DEFAULT_EXTENSION_CONFIG.responsesCompactApis],
-				...(options.config ?? {}),
-			},
-			source: undefined,
-			warnings: [],
-		}),
-	}));
-
-	mock.module("./native-fallback", () => ({
-		runNativeFallbackCompaction: async (args: Record<string, unknown>) => {
-			fallbackCalls.push(args);
-			return options.nativeFallbackResult ?? { ok: false, reason: "no-model-configured" };
-		},
-	}));
-
-	mock.module("./compact-client", () => ({
-		executeNativeCompaction: async (args: Record<string, unknown>) => {
-			compactCalls.push(args);
-			return (
-				options.compactResult ?? {
-					ok: true,
-					status: 200,
-					compactedWindow: [{ type: "message", role: "assistant", status: "completed", id: "cmp_default", content: [] }],
-					compactResponseId: "resp_default",
-					createdAt: nextTimestamp(),
-					response: {
-						id: "resp_default",
-						created_at: nextTimestamp(),
-						output: [{ type: "message", role: "assistant", status: "completed", id: "cmp_default", content: [] }],
-					},
-				}
-			);
-		},
-	}));
-
-	mock.module("./compact-client-v2", () => ({
-		executeV2Compaction: async (args: Record<string, unknown>) => {
-			v2CompactCalls.push(args);
-			return (
-				options.v2CompactResult ?? {
-					ok: false,
-					reason: "no-compaction-output",
-				}
-			);
-		},
-	}));
-
 	const handlers = new Map<string, HookHandler>();
-	const { default: extension } = await import(`./extension-runtime.ts?test=${crypto.randomUUID()}`);
-	extension({
-		on: (eventName: string, handler: HookHandler) => {
-			handlers.set(eventName, handler);
+	registerExtensionRuntime(
+		{
+			on: (eventName: string, handler: HookHandler) => {
+				handlers.set(eventName, handler);
+			},
+		} as never,
+		{
+			loadExtensionConfig: () => ({
+				config: {
+					...DEFAULT_EXTENSION_CONFIG,
+					responsesCompactApis: [...DEFAULT_EXTENSION_CONFIG.responsesCompactApis],
+					...(options.config ?? {}),
+				},
+				source: undefined,
+				warnings: [],
+			}),
+			runNativeFallbackCompaction: async (args: Record<string, unknown>) => {
+				fallbackCalls.push(args);
+				return (options.nativeFallbackResult ?? { ok: false, reason: "no-model-configured" }) as never;
+			},
+			executeNativeCompaction: async (args: Record<string, unknown>) => {
+				compactCalls.push(args);
+				return (
+					options.compactResult ?? {
+						ok: true,
+						status: 200,
+						compactedWindow: [{ type: "message", role: "assistant", status: "completed", id: "cmp_default", content: [] }],
+						compactResponseId: "resp_default",
+						createdAt: nextTimestamp(),
+						response: {
+							id: "resp_default",
+							created_at: nextTimestamp(),
+							output: [{ type: "message", role: "assistant", status: "completed", id: "cmp_default", content: [] }],
+						},
+					}
+				) as never;
+			},
+			executeV2Compaction: async (args: Record<string, unknown>) => {
+				v2CompactCalls.push(args);
+				return (
+					options.v2CompactResult ?? {
+						ok: false,
+						reason: "no-compaction-output",
+					}
+				) as never;
+			},
 		},
-	} as never);
+	);
 
 	const sessionBeforeCompact = handlers.get("session_before_compact");
 	const beforeProviderRequest = handlers.get("before_provider_request");
@@ -412,10 +368,8 @@ async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 }
 
 afterEach(() => {
-	serializerImportCounter = 0;
 	timestampCounter = 0;
 	clearRequestContextCache();
-	mock.restore();
 });
 
 test("manual /compact preserves tool/result ordering + assistant phases and persists the native window", async () => {

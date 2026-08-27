@@ -2,10 +2,11 @@
 
 [English](README.md) | 中文
 
-一个 [pi](https://github.com/nicepkg/pi) 扩展，通过两条策略提升上下文压缩效果：
+一个 [pi](https://github.com/nicepkg/pi) 扩展，通过三条协同策略提升上下文压缩效果：
 
-1. **OpenAI Responses 系列 API** 使用提供商原生压缩端点，保留纯文本摘要无法留存的不透明上下文。
-2. **其他所有 API**（Anthropic、Gemini 等）可用一个**独立的低成本模型**执行 pi 内置压缩，避免在主模型上消耗额度。
+1. 可选的 **mid-run guard** 在工具循环占满上下文时先中止运行，等待 `agent_settled` 后只压缩一次，再通过隐藏消息继续任务。
+2. **OpenAI Responses 系列 API** 使用提供商原生压缩端点，保留纯文本摘要无法留存的不透明上下文。
+3. **其他所有 API**（Anthropic、Gemini 等）可用一个**独立的低成本模型**执行 pi 内置压缩，避免在主模型上消耗额度。
 
 所有环节都安全降级——任何步骤无法执行时，pi 的默认压缩自动接管。
 
@@ -44,6 +45,10 @@ cd pi-better-compaction && pi install .
 ```jsonc
 {
   "enabled": true,
+  "midRun": {
+    "enabled": false,
+    "thresholdPercent": 80
+  },
   "compactionVersion": "v2",
   "compactionModel": null,
   "compactionThinkingLevel": "off",
@@ -65,6 +70,8 @@ cd pi-better-compaction && pi install .
 | 选项 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `enabled` | `boolean` | `true` | 总开关。设为 `false` 完全禁用扩展。 |
+| `midRun.enabled` | `boolean` | `false` | 启用 mid-run guard。上下文达到阈值后，它可能主动中止长工具循环。 |
+| `midRun.thresholdPercent` | `number` | `80` | 工具型 turn 完成后触发 mid-run guard 的上下文占用百分比。必须大于 0 且不超过 100。 |
 | `compactionVersion` | `"v1" \| "v2"` | `"v2"` | Responses 系列 API 的压缩协议。**V2**（流式，加密 blob）是 OpenAI 当前默认协议；**V1** 使用旧版 `/responses/compact` 端点。 |
 | `compactionModel` | `string \| null` | `null` | 回退压缩使用的模型（用于非 Responses API，或原生压缩失败时）。格式：`"provider/model-id"`，如 `"openai/gpt-5.1-mini"`。`null` = 由 pi 使用当前对话模型。 |
 | `compactionThinkingLevel` | `string` | `"off"` | 回退压缩模型的思考级别。可选：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`。 |
@@ -76,6 +83,17 @@ cd pi-better-compaction && pi install .
 | `logCompactResponses` | `boolean` | `false` | 写入压缩端点的请求/响应调试文件。 |
 | `redactSensitiveData` | `boolean` | `true` | 在调试文件中脱敏。 |
 | `artifactRoot` | `string` | `"~/.pi/agent/artifacts/pi-better-compaction"` | 调试文件根目录。支持 `~/` 和相对路径（相对于配置文件目录解析）。 |
+
+### 示例：启用 mid-run 压缩
+
+```json
+{
+  "midRun": {
+    "enabled": true,
+    "thresholdPercent": 80
+  }
+}
+```
 
 ### 示例：使用低成本模型做回退压缩
 
@@ -95,6 +113,8 @@ cd pi-better-compaction && pi install .
 ```
 
 ## 工作原理
+
+启用 `midRun.enabled` 后，超过阈值的工具型 `turn_end` 只调用 `ctx.abort()`。Pi 发出 `agent_settled` 后，guard 会复用 abort 收尾阶段已经完成的压缩；如果没有，则只调用一次 `ctx.compact()`。压缩成功或竞争合并后，通过隐藏 custom message 触发下一轮。压缩失败时不会自动继续，避免进入“压缩失败—继续—再次失败”的循环。
 
 pi 触发压缩时（`session_before_compact`）：
 
