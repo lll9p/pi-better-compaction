@@ -10,7 +10,6 @@ import { executeV2Compaction } from "./compact-client-v2";
 import { loadExtensionConfig } from "./config";
 import { writeDebugArtifact } from "./debug";
 import { resolveLatestNativeCompactionEntry } from "./details-store";
-import { registerMidRunGuard } from "./midrun";
 import { runNativeFallbackCompaction } from "./native-fallback";
 import {
 	rewriteResponsesPayloadWithNativeReplay,
@@ -672,8 +671,7 @@ export function registerExtensionRuntime(
 	pi: ExtensionAPI,
 	dependencies: ExtensionRuntimeDependencies = DEFAULT_DEPENDENCIES,
 ): void {
-	registerMidRunGuard(pi, dependencies.loadExtensionConfig);
-
+	// Mid-run compaction is intentionally disabled regardless of config.
 	pi.on("session_start", (_event, ctx) => {
 		const { config, source, warnings } = dependencies.loadExtensionConfig();
 		if (!config.enabled) return;
