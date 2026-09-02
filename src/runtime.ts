@@ -201,7 +201,12 @@ export async function resolveNativeCompactionEnvironment(
 		};
 	}
 
-	const currentModel = ctx.model;
+	const modelChange = ctx.sessionManager.getBranch().findLast((entry) => entry.type === "model_change");
+	const currentModel =
+		ctx.model ??
+		(modelChange?.type === "model_change"
+			? ctx.modelRegistry.find(modelChange.provider, modelChange.modelId)
+			: undefined);
 	const descriptor = getRuntimeModelDescriptor(currentModel);
 	if (!currentModel || !descriptor.provider || !descriptor.api || !descriptor.model) {
 		return {
