@@ -201,12 +201,16 @@ export async function resolveNativeCompactionEnvironment(
 		};
 	}
 
-	const modelChange = ctx.sessionManager.getBranch().findLast((entry) => entry.type === "model_change");
-	const currentModel =
-		ctx.model ??
-		(modelChange?.type === "model_change"
-			? ctx.modelRegistry.find(modelChange.provider, modelChange.modelId)
-			: undefined);
+	let sessionModel: RuntimeModel | undefined;
+	const branch = ctx.sessionManager.getBranch();
+	for (let index = branch.length - 1; index >= 0; index -= 1) {
+		const entry = branch[index];
+		if (entry?.type === "model_change") {
+			sessionModel = ctx.modelRegistry.find(entry.provider, entry.modelId);
+			break;
+		}
+	}
+	const currentModel = ctx.model ?? sessionModel;
 	const descriptor = getRuntimeModelDescriptor(currentModel);
 	if (!currentModel || !descriptor.provider || !descriptor.api || !descriptor.model) {
 		return {
