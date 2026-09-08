@@ -121,7 +121,7 @@ export async function executeNativeCompaction(
 	options: ExecuteNativeCompactionOptions,
 ): Promise<NativeCompactionClientResult> {
 	const { runtime, request, signal, settings, context } = options;
-	const headers = toHeaders(runtime);
+	const headers = toHeaders(runtime, JSON_CONTENT_TYPE, request.input);
 
 	if (signal?.aborted) {
 		const aborted: NativeCompactionClientFailure = {

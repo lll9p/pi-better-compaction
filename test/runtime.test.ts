@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildResponsesUrl, resolveNativeCompactionEnvironment } from "../src/runtime";
+import { toHeaders } from "../src/shared-headers";
 
 describe("buildResponsesUrl", () => {
 	test("builds openai responses URL", () => {
@@ -203,13 +204,14 @@ describe("resolveNativeCompactionEnvironment", () => {
 		});
 	});
 
-	test("filters null-valued headers from ProviderHeaders", async () => {
+	test("preserves resolved null header removals until model headers have been merged", async () => {
 		const resolution = await resolveNativeCompactionEnvironment({
 			model: {
 				provider: "openai",
 				api: "openai-responses",
 				id: "gpt-5.6-sol",
 				baseUrl: "https://example.com/v1",
+				headers: { "x-remove": "model-value", "x-keep": "model-value" },
 			},
 			modelRegistry: {
 				async getApiKeyAndHeaders() {
@@ -233,8 +235,28 @@ describe("resolveNativeCompactionEnvironment", () => {
 				headers: {
 					"x-keep": "yes",
 					"x-also-keep": "ok",
+					"x-remove": null,
 				},
 			}),
 		});
+		if (resolution.ok) {
+			expect(toHeaders(resolution.runtime)["x-remove"]).toBeUndefined();
+			expect(toHeaders(resolution.runtime)["x-keep"]).toBe("yes");
+		}
+	});
+
+	test("OAuth baseUrl overrides configuration for transport and native identity without mutating model", async () => {
+		const model = { provider: "github-copilot", api: "openai-responses", id: "gpt-6-astra", baseUrl: "https://api.individual.githubcopilot.com" };
+		const resolution = await resolveNativeCompactionEnvironment({ model, modelRegistry: {
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test", baseUrl: "https://api.enterprise.githubcopilot.com/", headers: { "x-oauth": "resolved" } }),
+		} } as any);
+		expect(resolution.ok).toBe(true);
+		if (!resolution.ok) return;
+		expect(resolution.runtime.baseUrl).toBe("https://api.enterprise.githubcopilot.com");
+		expect(resolution.runtime.responsesUrl).toBe("https://api.enterprise.githubcopilot.com/responses");
+		expect(resolution.runtime.compactUrl).toBe("https://api.enterprise.githubcopilot.com/responses/compact");
+		expect(resolution.runtime.currentModel.baseUrl).toBe(resolution.runtime.baseUrl);
+		expect(model.baseUrl).toBe("https://api.individual.githubcopilot.com");
+		expect(toHeaders(resolution.runtime)["x-oauth"]).toBe("resolved");
 	});
 });

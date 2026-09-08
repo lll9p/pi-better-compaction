@@ -34,6 +34,8 @@ export type V2CompactionSuccess = {
 	responseId?: string;
 	createdAt?: string;
 	usage?: V2CompactionUsage;
+	status?: number;
+	outputItemTypes?: string[];
 };
 
 export type V2CompactionFailureReason =
@@ -43,13 +45,18 @@ export type V2CompactionFailureReason =
 	| "no-compaction-output"
 	| "multiple-compaction-outputs"
 	| "stream-parse-error"
-	| "retries-exhausted";
+	| "retries-exhausted"
+	| "timeout"
+	| "incomplete-stream"
+	| "unexpected-output-after-compaction";
 
 export type V2CompactionFailure = {
 	ok: false;
 	reason: V2CompactionFailureReason;
 	status?: number;
 	errorMessage?: string;
+	outputItemTypes?: string[];
+	transportCode?: string;
 };
 
 export type V2CompactionResult = V2CompactionSuccess | V2CompactionFailure;
@@ -59,6 +66,8 @@ export type ExecuteV2CompactionOptions = {
 	request: NativeCompactionRequestBody;
 	signal?: AbortSignal;
 	maxRetries?: number;
+	/** Total deadline across all attempts, including reading the stream. */
+	timeoutMs?: number;
 	settings?: ExtensionConfig;
 	context?: ArtifactContext;
 };
@@ -67,6 +76,9 @@ export type ExecuteV2CompactionOptions = {
 
 const DEFAULT_MAX_RETRIES = 2;
 const SSE_ACCEPT = "text/event-stream";
+const DEFAULT_TIMEOUT_MS = 120_000;
+// Copilot rejects compaction_trigger with a smaller explicit output ceiling.
+const COPILOT_COMPACTION_OUTPUT_CEILING = 20_000;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -89,13 +101,22 @@ function writeV2Artifact(
 	context: ArtifactContext | undefined,
 ): void {
 	if (!settings || !context) return;
-	writeDebugArtifact("compact-response", data, settings, context);
+	// Never send authentication header values or opaque state to the logger.
+	const scrub = (value: unknown, key = ""): unknown => {
+		if (key === "headers" && isRecord(value)) return { names: Object.keys(value) };
+		if (key === "encrypted_content") return "[OPAQUE STATE OMITTED]";
+		if (key === "errorMessage") return "[See failure metadata]";
+		if (Array.isArray(value)) return value.map((item) => scrub(item));
+		if (isRecord(value)) return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, scrub(v, k)]));
+		return value;
+	};
+	writeDebugArtifact("compact-response", scrub(data), settings, context);
 }
 
 // ── SSE stream processing ──────────────────────────────────────────────
 
 type StreamCollectionResult =
-	| { ok: true; compactionItems: CompactionItem[]; responseId?: string; createdAt?: string; usage?: V2CompactionUsage }
+	| { ok: true; compactionItems: CompactionItem[]; responseId?: string; createdAt?: string; usage?: V2CompactionUsage; outputItemTypes: string[] }
 	| { ok: false; reason: V2CompactionFailureReason; errorMessage?: string };
 
 /**
@@ -107,101 +128,80 @@ type StreamCollectionResult =
  * - `response.failed` / `error` for server-side errors
  */
 async function collectStreamOutput(response: Response, signal?: AbortSignal): Promise<StreamCollectionResult> {
-	const body = response.body;
-	if (!body) {
+	if (!response.body) {
 		return { ok: false, reason: "stream-parse-error", errorMessage: "Response body is null" };
 	}
 
-	const compactionItems: CompactionItem[] = [];
+	let outputItems: unknown[] = [];
 	let responseId: string | undefined;
 	let createdAt: string | undefined;
 	let usage: V2CompactionUsage | undefined;
+	let completed = false;
 	let serverError: string | undefined;
-
-	const reader = body.getReader();
+	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
 	let buffer = "";
+	const cancelRead = () => { void reader.cancel().catch(() => {}); };
+	signal?.addEventListener("abort", cancelRead, { once: true });
+
+	function processLine(line: string): void {
+		const trimmed = line.trim();
+		if (!trimmed.startsWith("data:")) return;
+		const json = trimmed.slice(5).trim();
+		if (json === "[DONE]") return;
+		const event: unknown = JSON.parse(json);
+		if (!isRecord(event)) throw new Error("Invalid SSE event");
+		if (event.type === "response.output_item.done") {
+			outputItems.push(event.item);
+		} else if (event.type === "response.completed" && isRecord(event.response)) {
+			const resp = event.response;
+			completed = true;
+			responseId = typeof resp.id === "string" ? resp.id : undefined;
+			createdAt = normalizeTimestamp(resp.created_at);
+			if (isRecord(resp.usage)) usage = resp.usage as V2CompactionUsage;
+			// The terminal output is authoritative (some gateways omit item.done).
+			if (Array.isArray(resp.output) && resp.output.length > 0) outputItems = resp.output;
+		} else if (["response.failed", "response.incomplete", "error"].includes(String(event.type))) {
+			const error = event.error ?? (isRecord(event.response) ? event.response.error : undefined);
+			serverError = isRecord(error) && typeof error.message === "string" ? error.message : String(event.type);
+		}
+	}
 
 	try {
-		while (true) {
-			if (signal?.aborted) {
-				reader.cancel();
-				return { ok: false, reason: "aborted" as const };
-			}
-
+		while (!signal?.aborted) {
 			const { done, value } = await reader.read();
 			if (done) break;
-
 			buffer += decoder.decode(value, { stream: true });
 			const lines = buffer.split("\n");
-			// Keep the last incomplete line in the buffer.
 			buffer = lines.pop() ?? "";
-
-			for (const line of lines) {
-				const trimmed = line.trim();
-				if (!trimmed || trimmed.startsWith(":")) continue;
-				if (!trimmed.startsWith("data: ")) continue;
-
-				const jsonStr = trimmed.slice(6);
-				if (jsonStr === "[DONE]") continue;
-
-				let event: Record<string, unknown>;
-				try {
-					event = JSON.parse(jsonStr);
-					if (!isRecord(event)) continue;
-				} catch {
-					continue;
-				}
-
-				const eventType = event.type;
-
-				if (eventType === "response.output_item.done") {
-					const item = event.item;
-					if (isCompactionItem(item)) {
-						compactionItems.push({
-							type: "compaction",
-							id: typeof item.id === "string" ? item.id : undefined,
-							encrypted_content: item.encrypted_content,
-						});
-					}
-					continue;
-				}
-
-				if (eventType === "response.completed") {
-					const resp = event.response;
-					if (isRecord(resp)) {
-						responseId = typeof resp.id === "string" ? resp.id : undefined;
-						createdAt = normalizeTimestamp(resp.created_at);
-						if (isRecord(resp.usage)) {
-							usage = resp.usage as V2CompactionUsage;
-						}
-					}
-					continue;
-				}
-
-				if (eventType === "response.failed" || eventType === "error") {
-					const errorObj = event.error ?? event;
-					serverError = isRecord(errorObj)
-						? (typeof errorObj.message === "string" ? errorObj.message : JSON.stringify(errorObj))
-						: String(errorObj);
-					continue;
-				}
-			}
+			for (const line of lines) processLine(line);
 		}
+		if (signal?.aborted) return { ok: false, reason: "aborted" };
+		buffer += decoder.decode();
+		if (buffer.trim()) processLine(buffer);
 	} catch (error) {
-		if (isAbortError(error)) {
-			return { ok: false, reason: "aborted" as const };
-		}
+		if (signal?.aborted || isAbortError(error)) return { ok: false, reason: "aborted" };
 		return { ok: false, reason: "stream-parse-error", errorMessage: error instanceof Error ? error.message : String(error) };
 	} finally {
-		try { reader.releaseLock(); } catch { /* noop */ }
+		signal?.removeEventListener("abort", cancelRead);
+		await reader.cancel().catch(() => {});
+		reader.releaseLock();
 	}
 
-	if (serverError) {
-		return { ok: false, reason: "stream-parse-error", errorMessage: serverError };
+	if (serverError) return { ok: false, reason: "stream-parse-error", errorMessage: serverError };
+	if (!completed) return { ok: false, reason: "incomplete-stream" };
+	const compactionItems = outputItems.filter(isCompactionItem).map((item) => ({
+		type: "compaction" as const,
+		...(typeof item.id === "string" ? { id: item.id } : {}),
+		encrypted_content: item.encrypted_content,
+	}));
+	const firstCompaction = outputItems.findIndex(isCompactionItem);
+	// V2 persists only retained input + blob. Never silently discard a generated tail.
+	if (firstCompaction >= 0 && outputItems.slice(firstCompaction + 1).some((item) => !isCompactionItem(item))) {
+		return { ok: false, reason: "unexpected-output-after-compaction" };
 	}
-
-	return { ok: true, compactionItems, responseId, createdAt, usage };
+	return { ok: true, compactionItems, responseId, createdAt, usage,
+		outputItemTypes: outputItems.map((item) => isRecord(item) && typeof item.type === "string" ? item.type : "unknown") };
 }
 
 function normalizeTimestamp(value: unknown): string | undefined {
@@ -237,7 +237,7 @@ async function executeV2Attempt(
 			signal,
 		});
 	} catch (error) {
-		if (isAbortError(error)) {
+		if (signal?.aborted || isAbortError(error)) {
 			return { failure: { ok: false, reason: "aborted" } };
 		}
 		return {
@@ -245,6 +245,7 @@ async function executeV2Attempt(
 				ok: false,
 				reason: "network-error",
 				errorMessage: error instanceof Error ? error.message : String(error),
+				transportCode: getTransportCode(error),
 			},
 		};
 	}
@@ -295,13 +296,13 @@ function isRetryable(result: V2CompactionFailure): boolean {
  *
  * Retries recoverable failures up to `maxRetries` times (default 2).
  */
-export async function executeV2Compaction(
+async function executeV2CompactionWithSignal(
 	options: ExecuteV2CompactionOptions,
 ): Promise<V2CompactionResult> {
 	const { runtime, request, signal, settings, context } = options;
 	const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
 
-	const headers = toHeaders(runtime, SSE_ACCEPT);
+	const headers = toHeaders(runtime, SSE_ACCEPT, request.input);
 	const url = runtime.responsesUrl;
 
 	// Build request body: input + compaction_trigger, stream=true.
@@ -309,6 +310,10 @@ export async function executeV2Compaction(
 		...request,
 		input: [...request.input, { type: "compaction_trigger" }],
 		stream: true,
+		...(runtime.provider === "github-copilot" ? {
+			store: false,
+			max_output_tokens: COPILOT_COMPACTION_OUTPUT_CEILING,
+		} : {}),
 	};
 
 	let lastFailure: V2CompactionFailure | undefined;
@@ -324,7 +329,7 @@ export async function executeV2Compaction(
 			return aborted;
 		}
 
-		const { result, failure } = await executeV2Attempt(url, requestBody, headers, signal);
+		const { response, result, failure } = await executeV2Attempt(url, requestBody, headers, signal);
 
 		if (failure) {
 			lastFailure = failure;
@@ -346,7 +351,7 @@ export async function executeV2Compaction(
 		}
 
 		if (!result.ok) {
-			lastFailure = { ok: false, reason: result.reason, errorMessage: result.errorMessage };
+			lastFailure = { ok: false, reason: result.reason, status: response?.status, errorMessage: result.errorMessage };
 			if (result.reason === "aborted" || !isRetryable(lastFailure) || attempt >= maxRetries) {
 				writeV2Artifact(
 					{ request: { url, headers, body: requestBody }, attempt, outcome: lastFailure },
@@ -363,6 +368,8 @@ export async function executeV2Compaction(
 			const noOutput: V2CompactionFailure = {
 				ok: false,
 				reason: "no-compaction-output",
+				status: response?.status,
+				outputItemTypes: result.outputItemTypes,
 			};
 			writeV2Artifact(
 				{ request: { url, headers, body: requestBody }, attempt, outcome: noOutput },
@@ -376,6 +383,8 @@ export async function executeV2Compaction(
 			const multiOutput: V2CompactionFailure = {
 				ok: false,
 				reason: "multiple-compaction-outputs",
+				status: response?.status,
+				outputItemTypes: result.outputItemTypes,
 				errorMessage: `Expected 1 compaction item, got ${result.compactionItems.length}`,
 			};
 			writeV2Artifact(
@@ -389,6 +398,8 @@ export async function executeV2Compaction(
 		const success: V2CompactionSuccess = {
 			ok: true,
 			compactionItem: result.compactionItems[0]!,
+			status: response?.status,
+			outputItemTypes: result.outputItemTypes,
 			responseId: result.responseId,
 			createdAt: result.createdAt,
 			usage: result.usage,
@@ -425,4 +436,49 @@ export async function executeV2Compaction(
 		context,
 	);
 	return exhausted;
+}
+
+function getTransportCode(error: unknown): string | undefined {
+	const cause = error instanceof Error ? error.cause : undefined;
+	const code = isRecord(cause) ? cause.code : undefined;
+	return typeof code === "string" && /^(ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|UND_ERR_SOCKET|UND_ERR_CONNECT_TIMEOUT|UND_ERR_REQ_CONTENT_LENGTH_MISMATCH)$/.test(code)
+		? code : undefined;
+}
+
+/** A bounded V2 attempt with payload-independent, credential-free diagnostics. */
+export async function executeV2Compaction(options: ExecuteV2CompactionOptions): Promise<V2CompactionResult> {
+	const deadline = new AbortController();
+	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+	const timer = setTimeout(() => deadline.abort(), timeoutMs);
+	const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
+	let result: V2CompactionResult;
+	try {
+		result = await executeV2CompactionWithSignal({ ...options, signal });
+		if (options.signal?.aborted) result = { ok: false, reason: "aborted" };
+		else if (deadline.signal.aborted) result = { ok: false, reason: "timeout" };
+	} finally {
+		clearTimeout(timer);
+	}
+	if (options.settings && options.context) {
+		let destination: string | undefined;
+		try {
+			const url = new URL(options.runtime.responsesUrl);
+			destination = `${url.origin}${url.pathname}`;
+		} catch { /* Do not log a malformed URL that might contain credentials. */ }
+		const knownTypes = new Set(["compaction", "compaction_summary", "reasoning", "message", "function_call", "function_call_output"]);
+		writeDebugArtifact("compaction-event", {
+			event: "native-v2-result",
+			protocol: "compaction_trigger",
+			destination,
+			ok: result.ok,
+			status: result.status,
+			reason: result.ok ? undefined : result.reason,
+			transportCode: result.ok ? undefined : result.transportCode,
+			outputItemTypes: result.outputItemTypes?.map((type) => knownTypes.has(type) ? type : "other"),
+			compactionBlobPresent: result.ok,
+			compactionBlobLength: result.ok ? result.compactionItem.encrypted_content.length : 0,
+			timeoutMs,
+		}, options.settings, options.context);
+	}
+	return result;
 }

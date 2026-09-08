@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { executeV2Compaction, type V2CompactionResult } from "./compact-client-v2";
 import { buildResponsesUrl } from "./runtime";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DEFAULT_EXTENSION_CONFIG } from "./types";
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -550,4 +554,129 @@ describe("executeV2Compaction", () => {
 		expect(fetchHeaders?.get("originator")).toBe("pi");
 		expect(fetchHeaders?.get("openai-beta")).toBe("responses=experimental");
 	});
+});
+
+describe("Copilot V2 protocol and stream safety", () => {
+	test("uses Copilot ceiling and dynamic headers with resolved auth precedence", async () => {
+		let body: any;
+		let headers: Headers;
+		globalThis.fetch = mock(async (_url, init) => {
+			body = JSON.parse(String(init?.body));
+			headers = new Headers(init?.headers);
+			return sseResponse([compactionOutputItemDone("blob"), responseCompleted()]);
+		}) as typeof fetch;
+		const request = createRequest([{ role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,test", detail: "auto" }] }]);
+		await executeV2Compaction({ runtime: createRuntime({ provider: "github-copilot", headers: { "Authorization": "Bearer resolved", "X-Initiator": "agent", "x-remove": null }, currentModel: { ...baseModel, headers: { authorization: "Bearer stale", "x-remove": "stale" } } }), request, maxRetries: 0 });
+		expect(body.max_output_tokens).toBe(20000);
+		expect(body.store).toBe(false);
+		expect(body.context_management).toBeUndefined();
+		expect(body.input.at(-1)).toEqual({ type: "compaction_trigger" });
+		expect(headers!.get("authorization")).toBe("Bearer resolved");
+		expect(headers!.get("x-remove")).toBeNull();
+		expect(headers!.get("x-initiator")).toBe("agent");
+		expect(headers!.get("openai-intent")).toBe("conversation-edits");
+		expect(headers!.get("copilot-vision-request")).toBe("true");
+		expect(request.input).toHaveLength(1);
+	});
+
+	test("does not add Copilot settings for other Responses providers", async () => {
+		globalThis.fetch = mock(async (_url, init) => {
+			const body = JSON.parse(String(init?.body));
+			expect(body.max_output_tokens).toBeUndefined();
+			expect(new Headers(init?.headers).get("x-initiator")).toBeNull();
+			return sseResponse([compactionOutputItemDone("blob"), responseCompleted()]);
+		}) as typeof fetch;
+		expect((await executeV2Compaction({ runtime: createRuntime(), request: createRequest() })).ok).toBe(true);
+	});
+
+	for (const item of [
+		{ type: "message", role: "assistant", content: [{ type: "output_text", text: "must not lose me" }] },
+		{ type: "function_call", call_id: "tail", name: "read", arguments: "{}" },
+		{ type: "reasoning", encrypted_content: "not-a-compaction" },
+	]) {
+		test(`rejects post-blob ${item.type} rather than silently dropping it`, async () => {
+			globalThis.fetch = mock(async () => sseResponse([compactionOutputItemDone("blob"), { type: "response.output_item.done", item }, responseCompleted()])) as typeof fetch;
+			const result = await executeV2Compaction({ runtime: createRuntime(), request: createRequest() });
+			expect(result).toMatchObject({ ok: false, reason: "unexpected-output-after-compaction", status: 200 });
+		});
+	}
+
+	test("encrypted reasoning alone is not native compaction", async () => {
+		globalThis.fetch = mock(async () => sseResponse([{ type: "response.output_item.done", item: { type: "reasoning", encrypted_content: "reasoning-only" } }, responseCompleted()])) as typeof fetch;
+		expect(await executeV2Compaction({ runtime: createRuntime(), request: createRequest() })).toMatchObject({ ok: false, reason: "no-compaction-output", outputItemTypes: ["reasoning"] });
+	});
+
+	test("requires response.completed, not EOF or DONE after blob", async () => {
+		globalThis.fetch = mock(async () => new Response(sseBody([compactionOutputItemDone("blob")]) + 'data: [DONE]\n\n')) as typeof fetch;
+		expect(await executeV2Compaction({ runtime: createRuntime(), request: createRequest() })).toMatchObject({ ok: false, reason: "incomplete-stream" });
+	});
+
+	test("reads chunked CRLF and final line without newline, using terminal output without duplicates", async () => {
+		const terminal = { type: "response.completed", response: { output: [{ type: "compaction", encrypted_content: "blob" }] } };
+		const text = sseBody([compactionOutputItemDone("blob")]).replaceAll('\n', '\r\n') + `data:${JSON.stringify(terminal)}`;
+		globalThis.fetch = mock(async () => new Response(new ReadableStream({ start(controller) { for (const char of text) controller.enqueue(new TextEncoder().encode(char)); controller.close(); } }))) as typeof fetch;
+		const result = await executeV2Compaction({ runtime: createRuntime(), request: createRequest() });
+		expect(result.ok).toBe(true);
+		if (result.ok) expect(result.compactionItem).toEqual({ type: "compaction", encrypted_content: "blob" });
+	});
+
+	test("checks post-blob ordering in authoritative completed.output too", async () => {
+		globalThis.fetch = mock(async () => sseResponse([compactionOutputItemDone("blob"), { type: "response.completed", response: { output: [{ type: "compaction", encrypted_content: "blob" }, { type: "message" }] } }])) as typeof fetch;
+		expect(await executeV2Compaction({ runtime: createRuntime(), request: createRequest() })).toMatchObject({ ok: false, reason: "unexpected-output-after-compaction" });
+	});
+
+	for (const type of ["response.failed", "response.incomplete"]) {
+		test(`rejects ${type} after a compaction item`, async () => {
+			globalThis.fetch = mock(async () => sseResponse([compactionOutputItemDone("blob"), { type, response: { error: { message: "failure" } } }])) as typeof fetch;
+			expect(await executeV2Compaction({ runtime: createRuntime(), request: createRequest(), maxRetries: 0 })).toMatchObject({ ok: false, reason: "stream-parse-error", errorMessage: "failure" });
+		});
+	}
+
+	test("malformed SSE cannot be ignored before accepting a checkpoint", async () => {
+		globalThis.fetch = mock(async () => new Response('data: {broken}\n\n' + sseBody([compactionOutputItemDone("blob"), responseCompleted()]))) as typeof fetch;
+		expect(await executeV2Compaction({ runtime: createRuntime(), request: createRequest(), maxRetries: 0 })).toMatchObject({ ok: false, reason: "stream-parse-error" });
+	});
+
+	for (const mode of ["cancel", "timeout"]) {
+		test(`${mode} unblocks a pending stream read and does not retry`, async () => {
+			const controller = new AbortController();
+			let calls = 0;
+			let cancelled = false;
+			globalThis.fetch = mock(async () => {
+				calls++;
+				return new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(sseBody([compactionOutputItemDone("blob")]))); }, cancel() { cancelled = true; } }));
+			}) as typeof fetch;
+			const timer = mode === "cancel" ? setTimeout(() => controller.abort(), 10) : undefined;
+			try {
+				const result = await executeV2Compaction({ runtime: createRuntime(), request: createRequest(), signal: controller.signal, timeoutMs: mode === "timeout" ? 10 : 1000 });
+				expect(result).toMatchObject({ ok: false, reason: mode === "timeout" ? "timeout" : "aborted" });
+				expect(calls).toBe(1);
+				expect(cancelled).toBe(true);
+			} finally { clearTimeout(timer); }
+		});
+	}
+});
+
+test("V2 failure diagnostics work with raw logging off and never include credentials, state or server echoes", async () => {
+	const root = mkdtempSync(join(tmpdir(), "compaction-diagnostics-"));
+	try {
+		globalThis.fetch = mock(async () => new Response(JSON.stringify({ error: { message: "echo private-credential private-blob private-prompt" } }), { status: 401 })) as typeof fetch;
+		await executeV2Compaction({
+			runtime: createRuntime({ apiKey: "private-credential", headers: { authorization: "Bearer private-credential" }, responsesUrl: "https://example.com/responses?key=private-credential" }),
+			request: createRequest([{ type: "compaction", encrypted_content: "private-blob" }, { role: "user", content: "private-prompt" }]),
+			settings: { ...DEFAULT_EXTENSION_CONFIG, debug: true, logCompactResponses: false, logProviderPayloads: false, redactSensitiveData: false, artifactRoot: root },
+			context: { cwd: root, sessionId: "synthetic" },
+		});
+		const dir = join(root, "sessions", "synthetic", "compaction-events");
+		const text = readdirSync(dir).map((f) => readFileSync(join(dir, f), "utf8")).join("");
+		const data = JSON.parse(text).data;
+		expect(data).toMatchObject({ destination: "https://example.com/responses", protocol: "compaction_trigger", status: 401, reason: "non-2xx", compactionBlobPresent: false });
+		for (const secret of ["private-credential", "private-blob", "private-prompt"]) expect(text).not.toContain(secret);
+		expect(readdirSync(join(root, "sessions", "synthetic"))).toEqual(["compaction-events"]);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("V2 preserves a known transport failure code without relying on raw error logging", async () => {
+	globalThis.fetch = mock(async () => { throw new Error("fetch failed", { cause: { code: "UND_ERR_REQ_CONTENT_LENGTH_MISMATCH" } }); }) as typeof fetch;
+	expect(await executeV2Compaction({ runtime: createRuntime(), request: createRequest(), maxRetries: 0 })).toMatchObject({ ok: false, reason: "network-error", transportCode: "UND_ERR_REQ_CONTENT_LENGTH_MISMATCH" });
 });

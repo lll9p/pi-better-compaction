@@ -262,12 +262,16 @@ function createContext(args: {
 	systemPrompt?: string;
 	sessionContextMessages?: Record<string, unknown>[];
 	registryModels?: Array<{ provider: string; id: string }>;
+	authBaseUrl?: string;
 } = {}) {
 	const branchEntries = args.branchEntries ?? [];
 	const model = args.model ?? defaultModel;
 	const sessionContextMessages =
 		args.sessionContextMessages ?? branchEntries.filter((entry) => entry.type === "message").map(toReplayMessage);
+	const abortController = new AbortController();
 	return {
+		abort: () => abortController.abort(),
+		signal: abortController.signal,
 		cwd: "/tmp/pi-better-compaction-validation",
 		hasUI: false,
 		getSystemPrompt: () => args.systemPrompt ?? "Current instructions v1",
@@ -275,7 +279,7 @@ function createContext(args: {
 		modelRegistry: {
 			find: (provider: string, modelId: string) =>
 				(args.registryModels ?? []).find((entry) => entry.provider === provider && entry.id === modelId),
-			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "sk-test-native-compaction" }),
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "sk-test-native-compaction", baseUrl: args.authBaseUrl }),
 		},
 		sessionManager: {
 			getBranch: () => branchEntries,
@@ -428,6 +432,7 @@ test("manual /compact preserves tool/result ordering + assistant phases and pers
 		createContext({
 			model,
 			systemPrompt: "Current instructions v1",
+			branchEntries: [user, assistantCommentary, toolResult, assistantFinal],
 			sessionContextMessages: event.preparation.messagesToSummarize as Record<string, unknown>[],
 		}),
 	)) as {
@@ -475,6 +480,7 @@ test("first native compaction sends the full current session context, including 
 		createContext({
 			model,
 			systemPrompt: "Current instructions include the kept window too",
+			branchEntries: [summarizedUser, keptUser],
 			sessionContextMessages: [toReplayMessage(summarizedUser), toReplayMessage(keptUser)],
 		}),
 	);
@@ -898,7 +904,7 @@ test("a second compaction replays only the latest compacted window and keeps fre
 	expect(JSON.stringify(rewritten.input)).not.toContain("Interim question between compactions.");
 });
 
-test("unsupported model/provider switching fails open instead of replaying stale native state", async () => {
+test("unsupported model/provider switching aborts instead of dropping native state", async () => {
 	const { beforeProviderRequest } = await loadHookHarness();
 	const matchingModel = { ...defaultModel };
 	const switchedModel = {
@@ -930,17 +936,12 @@ test("unsupported model/provider switching fails open instead of replaying stale
 		instructions: "Instructions after switching back",
 		input: [{ role: "developer", content: "Fresh preamble after switching back" }],
 	};
-	const mismatchedLatestResult = await beforeProviderRequest(
-		{ payload: matchingPayload },
-		createContext({ branchEntries, model: matchingModel, systemPrompt: matchingPayload.instructions }),
-	);
-	const unsupportedProviderResult = await beforeProviderRequest(
-		{ payload: { ...matchingPayload, model: unsupportedProviderModel.id } },
-		createContext({ branchEntries, model: unsupportedProviderModel, systemPrompt: matchingPayload.instructions }),
-	);
-
-	expect(mismatchedLatestResult).toBeUndefined();
-	expect(unsupportedProviderResult).toBeUndefined();
+	const mismatchedContext = createContext({ branchEntries, model: matchingModel, systemPrompt: matchingPayload.instructions });
+	const unsupportedContext = createContext({ branchEntries, model: unsupportedProviderModel, systemPrompt: matchingPayload.instructions });
+	await expect(beforeProviderRequest({ payload: matchingPayload }, mismatchedContext)).rejects.toThrow("Request cancelled");
+	await expect(beforeProviderRequest({ payload: { ...matchingPayload, model: unsupportedProviderModel.id } }, unsupportedContext)).rejects.toThrow("Request cancelled");
+	expect(mismatchedContext.signal.aborted).toBe(true);
+	expect(unsupportedContext.signal.aborted).toBe(true);
 });
 
 test("responses compact failure falls back to the configured native model and returns its result", async () => {
@@ -978,6 +979,7 @@ test("responses compact failure falls back to the configured native model and re
 		createContext({
 			model,
 			systemPrompt: "Current instructions v1",
+			branchEntries: [user],
 			sessionContextMessages: [toReplayMessage(user)],
 		}),
 	)) as { compaction: Record<string, unknown> };
@@ -1030,6 +1032,7 @@ test("non-Responses model routes straight to the native-method fallback", async 
 		createContext({
 			model: anthropicModel,
 			systemPrompt: "Current instructions v1",
+			branchEntries: [user],
 			sessionContextMessages: [toReplayMessage(user)],
 		}),
 	)) as { compaction: Record<string, unknown> };
@@ -1079,7 +1082,7 @@ test("responses compact stores the extracted assistant summary text as the entry
 
 	const result = (await sessionBeforeCompact(
 		event,
-		createContext({ model, sessionContextMessages: [toReplayMessage(user)] }),
+		createContext({ model, branchEntries: [user], sessionContextMessages: [toReplayMessage(user)] }),
 	)) as { compaction: Record<string, unknown> };
 
 	expect(result.compaction.summary).toBe("Compaction covered the auth refactor.");
@@ -1117,6 +1120,7 @@ test("V2 compaction success returns compactedWindow with retained messages + blo
 		createContext({
 			model,
 			systemPrompt: "V2 test instructions",
+			branchEntries: [user],
 			sessionContextMessages: [toReplayMessage(user)],
 		}),
 	)) as { compaction: Record<string, unknown> };
@@ -1176,6 +1180,7 @@ test("V2 failure falls through to configured-model fallback", async () => {
 		createContext({
 			model,
 			systemPrompt: "V2 fallback test",
+			branchEntries: [user],
 			sessionContextMessages: [toReplayMessage(user)],
 		}),
 	)) as { compaction: Record<string, unknown> };
@@ -1210,6 +1215,7 @@ test("compactionVersion=v1 skips V2 entirely", async () => {
 		createContext({
 			model,
 			systemPrompt: "V1 only test",
+			branchEntries: [user],
 			sessionContextMessages: [toReplayMessage(user)],
 		}),
 	)) as { compaction: Record<string, unknown> };
@@ -1247,6 +1253,7 @@ test("V2 abort cancels without fallback", async () => {
 		createContext({
 			model,
 			systemPrompt: "V2 abort test",
+			branchEntries: [user],
 			sessionContextMessages: [toReplayMessage(user)],
 		}),
 	) as { cancel?: boolean };
@@ -1256,4 +1263,61 @@ test("V2 abort cancels without fallback", async () => {
 	expect(compactCalls).toHaveLength(0);
 	expect(fallbackCalls).toHaveLength(0);
 	expect(result.cancel).toBe(true);
+});
+
+test("Copilot persists resolved OAuth endpoint identity and replays only at that endpoint after reload", async () => {
+	const model = { ...defaultModel, provider: "github-copilot", id: "gpt-6-astra", baseUrl: "https://api.individual.githubcopilot.com" };
+	const authBaseUrl = "https://api.enterprise.githubcopilot.com";
+	const user = createUserEntry("copilot-user", "Record the code from the assistant.");
+	const assistant = createAssistantEntry("copilot-fact", [createTextBlock("code=assistant-only-fact")], model);
+	const branchEntries = [user, assistant];
+	const { sessionBeforeCompact, v2CompactCalls } = await loadHookHarness({ v2CompactResult: {
+		ok: true, compactionItem: { type: "compaction", encrypted_content: "test-opaque-state" },
+	} });
+	const result = await sessionBeforeCompact({ preparation: {
+		messagesToSummarize: [user.message], turnPrefixMessages: [], firstKeptEntryId: user.id, tokensBefore: 400,
+	}, signal: new AbortController().signal }, createContext({ branchEntries, model, authBaseUrl })) as any;
+	expect(result.compaction.details.baseUrl).toBe(authBaseUrl);
+	expect((v2CompactCalls[0].runtime as any).responsesUrl).toBe(`${authBaseUrl}/responses`);
+	// Model a persisted checkpoint / reload without writing any session file.
+	const checkpoint = JSON.parse(JSON.stringify({ type: "compaction", id: "copilot-checkpoint", timestamp: nextTimestamp(), ...result.compaction }));
+	const tail = createUserEntry("copilot-tail", "What was the code? Also retain this new tail.");
+	branchEntries.push(checkpoint, tail);
+	const payload = await buildPiReplayPayload({ model, branchEntries, compactionEntry: checkpoint, instructions: "fresh", freshPreamble: "fresh" });
+	const reloaded = await loadHookHarness();
+	const rewritten = await reloaded.beforeProviderRequest({ payload }, createContext({ branchEntries, model, authBaseUrl })) as any;
+	expect(rewritten.input).toContainEqual({ type: "compaction", encrypted_content: "test-opaque-state" });
+	expect(JSON.stringify(rewritten)).not.toContain("assistant-only-fact");
+	expect(JSON.stringify(rewritten)).toContain("Also retain this new tail");
+	const blobIndex = rewritten.input.findIndex((item: any) => item.type === "compaction");
+	expect(JSON.stringify(rewritten.input.slice(blobIndex + 1))).toContain("Also retain this new tail");
+	const staleContext = createContext({ branchEntries, model, authBaseUrl: "https://api.business.githubcopilot.com" });
+	await expect(reloaded.beforeProviderRequest({ payload }, staleContext)).rejects.toThrow("Request cancelled");
+	expect(staleContext.signal.aborted).toBe(true);
+	// A subsequent compaction uses the stored blob and only the post-checkpoint tail.
+	await reloaded.sessionBeforeCompact({ preparation: { messagesToSummarize: [], turnPrefixMessages: [], firstKeptEntryId: user.id, tokensBefore: 400 }, signal: new AbortController().signal }, createContext({ branchEntries, model, authBaseUrl }));
+	const nextRequest = reloaded.v2CompactCalls[0].request as any;
+	expect(nextRequest.input[0]).toEqual({ role: "user", content: [{ type: "input_text", text: "Record the code from the assistant." }] });
+	expect(JSON.stringify(nextRequest.input)).not.toContain("assistant-only-fact");
+	expect(JSON.stringify(nextRequest.input)).toContain("test-opaque-state");
+});
+
+test("unsigned assistant IDs match Pi; an injected ID mismatch cancels instead of losing the checkpoint", async () => {
+	const user = createUserEntry("unsigned-user", "Seed history.");
+	const assistant = createAssistantEntry("unsigned-assistant", [createTextBlock("Unsigned imported assistant history.")]);
+	// Explicitly remove the signature: imports or non-Responses model histories may lack it.
+	delete (assistant.message!.content as any[])[0].textSignature;
+	const checkpoint = createCompactionEntry({ id: "unsigned-checkpoint", firstKeptEntryId: user.id, compactedWindow: [{ type: "compaction", encrypted_content: "opaque-fixture" }] });
+	const branchEntries = [user, assistant, checkpoint, createUserEntry("unsigned-tail", "Continue.")];
+	const payload = await buildPiReplayPayload({ branchEntries, compactionEntry: checkpoint, instructions: "fresh", freshPreamble: "fresh" });
+	const assistantItem = payload.input.find((item: any) => item.role === "assistant") as any;
+	expect(assistantItem.id).toBe("msg_pi_2");
+	const { beforeProviderRequest } = await loadHookHarness();
+	expect(await beforeProviderRequest({ payload }, createContext({ branchEntries }))).toMatchObject({ input: expect.arrayContaining([{ type: "compaction", encrypted_content: "opaque-fixture" }]) });
+	assistantItem.id = "incorrect-id";
+	const before = JSON.stringify({ payload, branchEntries });
+	const ctx = createContext({ branchEntries });
+	await expect(beforeProviderRequest({ payload }, ctx)).rejects.toThrow("Request cancelled");
+	expect(ctx.signal.aborted).toBe(true);
+	expect(JSON.stringify({ payload, branchEntries })).toBe(before);
 });
