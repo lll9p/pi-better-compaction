@@ -5,10 +5,10 @@ English | [中文](README.zh-CN.md)
 A [pi](https://github.com/nicepkg/pi) extension that upgrades context compaction with three coordinated strategies:
 
 1. An optional **mid-run guard** aborts an oversized tool loop, waits for `agent_settled`, compacts once, then resumes with a hidden custom message.
-2. **OpenAI Responses APIs** use the provider's native compaction endpoint, preserving opaque context that plain text summaries lose.
+2. **OpenAI Responses APIs**, including supported GitHub Copilot models, use the provider's native compaction endpoint, preserving opaque context that plain text summaries lose.
 3. **All other APIs** (Anthropic, Gemini, etc.) can run pi's built-in compaction with a **dedicated cheaper/faster model**, so summarization doesn't consume quota on your primary model.
 
-Initial compaction attempts can fall back to pi's default summarization. **Once a native checkpoint exists, replay failures cancel the request instead of sending a placeholder without its encrypted history.** Keep this extension loaded while continuing a native-compacted session.
+Everything fails open — if any step cannot proceed, pi's default compaction takes over.
 
 ## Install
 
@@ -28,8 +28,7 @@ After installation, run `/reload`.
 
 ## Requirements
 
-- **pi** ≥ 0.84.3 (`@earendil-works/pi-coding-agent >= 0.84.3`, `@earendil-works/pi-ai >= 0.84.3`)
-- Serialization uses Pi's exported Responses converter. Paired Pi/pi-ai **0.84.3 and 0.84.4** are tested; future SDK versions are not pre-verified. Strict replay validation cancels rather than ignoring incompatibilities.
+- **pi** ≥ 0.84.3 (`@earendil-works/pi-coding-agent >= 0.84.3`)
 
 ## Configuration
 
@@ -70,7 +69,7 @@ If the file doesn't exist, all defaults apply. The extension never creates this 
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `enabled` | `boolean` | `true` | Disables compaction/replay when `false`. The native-checkpoint safety guard remains active: re-enable before continuing a session that depends on native state. |
+| `enabled` | `boolean` | `true` | Master switch. Set `false` to disable the extension entirely. |
 | `midRun.enabled` | `boolean` | `false` | Enable the mid-run guard. It may abort a long tool loop once context reaches the configured threshold. |
 | `midRun.thresholdPercent` | `number` | `80` | Context usage percentage that triggers the mid-run guard after a tool-bearing turn. Must be greater than 0 and at most 100. |
 | `compactionVersion` | `"v1" \| "v2"` | `"v2"` | Protocol for Responses-family APIs. **V2** (streaming, encrypted blob) is the current OpenAI default. **V1** uses the legacy `/responses/compact` endpoint. |
@@ -124,27 +123,11 @@ When pi triggers compaction (`session_before_compact`):
    - **V1**: POSTs to `/responses/compact`; receives an opaque compacted window.
    - On success, the compacted window is stored and replayed on subsequent requests via `before_provider_request`.
 
-2. **Not a Responses API, or native compact failed** → if no existing native checkpoint is required, and `compactionModel` is configured and differs from the current model, run pi's built-in `compact()` with that model. Otherwise protect the native checkpoint by cancelling.
+2. **Not a Responses API, or native compact failed** → if `compactionModel` is configured and differs from the current model, run pi's built-in `compact()` with that model.
 
-3. **No fallback configured and no native checkpoint to protect** → pi's default compaction runs as if the extension weren't installed.
+3. **No fallback configured** → pi's default compaction runs as if the extension weren't installed.
 
-Selection is by API type, not provider — any OpenAI-compatible proxy speaking a Responses API gets a native compact attempt. If the endpoint doesn't support it, an initial compaction attempt can fall through to the configured fallback. An existing native checkpoint is never silently replaced by fallback summarization.
-
-### GitHub Copilot Responses models
-
-Keep `compactionVersion: "v2"`. Native requests use Pi's resolved OAuth endpoint and headers, which can differ from the configured model URL (for example, Individual → Enterprise). The same resolved endpoint is part of the persisted checkpoint identity; a checkpoint is not replayed at a different endpoint or with a different provider/model.
-
-Copilot's `compaction_trigger` requires an explicit output ceiling of at least 20,000 tokens. The extension sets that ceiling only for Copilot; it is not a target response size. V2 requests have a two-minute total deadline across retries and honor cancellation. Missing completion, missing compaction output, or output after the blob never persists a partial checkpoint. Text fallback is allowed only when no existing native checkpoint would be lost; otherwise compaction is cancelled. Cancellation never starts fallback.
-
-A small synthetic Astra test verified native generation and factual recovery through reloaded hooks with unsigned and cross-model kept messages, without the original fact-bearing history (which was before Pi's kept boundary); a no-blob control could not recover the fact. This does not establish lossless memory or large-context reliability. Copilot's separate `/responses/compact` endpoint was unavailable; the alternative `context_management` protocol is not enabled by this patch.
-
-### Switching models or recovering a blocked native session
-
-Encrypted checkpoints are not portable across providers, models, or OAuth-resolved endpoints. If replay cannot be verified, the extension aborts and warns rather than silently using the placeholder summary. Restore the checkpoint's provider/model with its original OAuth endpoint and keep the extension enabled. If that is unavailable or replay still fails, use `/tree` to select a branch **before the native compaction**, where the original history is still present, before continuing with another model. Do not delete the checkpoint or disable/unload the extension to bypass the guard.
-
-Two hook phases are required: `context` checks native identity/availability before provider request construction (including unsupported providers such as Gemini); `before_provider_request` verifies exact serialized content and checkpoint replay. A thrown hook error alone does not block Pi's runner. Cancellation is verified with the real runner, Agent, and fake provider transports, not just direct hook assertions.
-
-Custom/grammar/deferred tool contexts that require serializer options not captured by this extension, and missing kept boundaries, are declined before checkpoint creation. Later payload changes are still subject to strict replay validation. Resolved HTTP headers override defaults, including `Authorization: null` and Codex overrides/removals; only `Content-Type: application/json` and the protocol's `Accept` value are mandatory exceptions.
+Selection is by API type, not provider — any OpenAI-compatible proxy speaking a Responses API gets a native compact attempt. If the endpoint doesn't support it, the request fails and falls through to the configured fallback.
 
 ## Debugging
 
@@ -156,8 +139,6 @@ Enable debug artifacts:
   "logCompactResponses": true
 }
 ```
-
-For payload-free V2 diagnostics, `debug: true` is sufficient; leave `logCompactResponses` and `logProviderPayloads` off. The `native-v2-result` event records destination (without query credentials), protocol, status/failure reason, known transport error code, returned item types when available, and blob presence/length, never the blob or auth headers. Raw provider payload logging can contain conversation data and opaque state; do not enable it for sensitive sessions.
 
 Then `/reload`, run `/compact`, send a follow-up message, and inspect:
 

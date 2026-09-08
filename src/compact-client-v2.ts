@@ -445,7 +445,17 @@ function getTransportCode(error: unknown): string | undefined {
 		? code : undefined;
 }
 
-/** A bounded V2 attempt with payload-independent, credential-free diagnostics. */
+/**
+ * A bounded V2 attempt with payload-independent, credential-free diagnostics.
+ * Copilot routes in Pi 0.84.4; tested means live native compaction and replay.
+ *
+ * | Provider (via Copilot) | API | Tested |
+ * | --- | --- | --- |
+ * | OpenAI (Astra) | Responses | Yes |
+ * | xAI (Grok 4.5/4.6) | Responses | No |
+ * | Google (Gemini) | Chat Completions | No; outside this path |
+ * | Anthropic (Opus) | Messages | No; outside this path |
+ */
 export async function executeV2Compaction(options: ExecuteV2CompactionOptions): Promise<V2CompactionResult> {
 	const deadline = new AbortController();
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
