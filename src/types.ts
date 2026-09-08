@@ -59,7 +59,7 @@ export type ExtensionConfig = {
 	 * Which compaction protocol to use for Responses-family APIs.
 	 * - "v2" (default): streaming CompactionTrigger via /responses endpoint.
 	 * - "v1": POST /responses/compact endpoint.
-	 * Failures use configured/Pi text fallback only before a native checkpoint exists.
+	 * V2 failures automatically fall back to V1.
 	 */
 	compactionVersion: CompactionVersion;
 	notifyOnLoad: boolean;
@@ -261,12 +261,7 @@ export function isNativeCompactionDetails(value: unknown): value is NativeCompac
 		(value.strategy === NATIVE_COMPACTION_STRATEGY || value.strategy === NATIVE_COMPACTION_STRATEGY_V2) &&
 		isNativeCompactionIdentity(value) &&
 		Array.isArray(value.compactedWindow) &&
-		value.compactedWindow.length > 0 &&
 		value.compactedWindow.every(isCompactedWindowItem) &&
-		(value.strategy !== NATIVE_COMPACTION_STRATEGY_V2 || value.compactedWindow.filter((item) =>
-			isRecord(item) && (item.type === "compaction" || item.type === "compaction_summary") &&
-			isNonEmptyString(item.encrypted_content),
-		).length === 1) &&
 		isNonEmptyString(value.createdAt) &&
 		(value.compactResponseId === undefined || isNonEmptyString(value.compactResponseId)) &&
 		(value.requestMeta === undefined || isNativeCompactionRequestMeta(value.requestMeta))

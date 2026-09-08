@@ -2,24 +2,12 @@ import type { CompactionEntry, SessionEntry } from "@earendil-works/pi-coding-ag
 import {
 	isNativeCompactionDetails,
 	isNativeCompactionEntry,
-	NATIVE_COMPACTION_FALLBACK_SUMMARY,
-	NATIVE_COMPACTION_STRATEGY,
-	NATIVE_COMPACTION_STRATEGY_V2,
 	type NativeCompactionDetails,
 	type NativeCompactionEntry,
 	type NativeCompactionIdentity,
 } from "./types";
 
 export type NativeCompactionEntryMatch = Partial<NativeCompactionIdentity>;
-
-/** Recognize a native dependency even when its details are damaged or missing. */
-export function requiresNativeReplay(entry: CompactionEntry | undefined): boolean {
-	if (!entry) return false;
-	const details = entry.details as { strategy?: unknown } | undefined;
-	return entry.summary === NATIVE_COMPACTION_FALLBACK_SUMMARY ||
-		details?.strategy === NATIVE_COMPACTION_STRATEGY ||
-		details?.strategy === NATIVE_COMPACTION_STRATEGY_V2;
-}
 
 export type LatestNativeCompactionResolutionFailureReason =
 	| "no-compaction"

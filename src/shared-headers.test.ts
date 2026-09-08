@@ -25,3 +25,14 @@ test("only accept and content-type are mandatory transport exceptions to resolve
 	expect(headers["content-type"]).toBe("application/json");
 	expect(headers.authorization).toBe("Bearer explicitly-resolved");
 });
+
+test("Copilot vision follows image content, including tool outputs, and is absent for text-only input", () => {
+	const copilot = runtime({ provider: "github-copilot", api: "openai-responses" });
+	const textHeaders = toHeaders(copilot, "application/json", [{ role: "user", content: "hello" }]);
+	expect(textHeaders["x-initiator"]).toBe("agent");
+	expect(textHeaders["openai-intent"]).toBe("conversation-edits");
+	expect(textHeaders["copilot-vision-request"]).toBeUndefined();
+	const imageOutput = [{ type: "function_call_output", output: [{ type: "input_image", image_url: "data:image/png;base64,test" }] }];
+	expect(toHeaders(copilot, "application/json", imageOutput)["copilot-vision-request"]).toBe("true");
+	expect(toHeaders(runtime(), "application/json", imageOutput)["copilot-vision-request"]).toBeUndefined();
+});

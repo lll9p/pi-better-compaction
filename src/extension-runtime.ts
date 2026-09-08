@@ -9,7 +9,7 @@ import { executeNativeCompaction } from "./compact-client";
 import { executeV2Compaction } from "./compact-client-v2";
 import { loadExtensionConfig } from "./config";
 import { writeDebugArtifact } from "./debug";
-import { findLatestCompactionEntry, requiresNativeReplay, resolveLatestNativeCompactionEntry } from "./details-store";
+import { resolveLatestNativeCompactionEntry } from "./details-store";
 import { registerMidRunGuard } from "./midrun";
 import { runNativeFallbackCompaction } from "./native-fallback";
 import {
@@ -343,7 +343,7 @@ async function runResponsesV2Compact(
 				event: "session_before_compact.v2-compact-failure",
 				reason: v2Result.reason,
 				status: v2Result.status,
-				// Detailed V2 transport metadata is logged by the client, never raw error bodies.
+				errorMessage: v2Result.errorMessage,
 			},
 			config,
 			ctx,
@@ -417,33 +417,10 @@ async function runResponsesV2Compact(
 	return { outcome: "success", compaction };
 }
 
-function nativeCompactionPreflight(
-	event: SessionBeforeCompactEvent,
-	ctx: ExtensionContext,
-	runtime: NativeCompactionRuntime,
-): string | undefined {
-	if (!ctx.sessionManager.getBranch().some((entry) => entry.id === event.preparation.firstKeptEntryId)) {
-		return "missing-kept-boundary";
-	}
-	const extras = getCompactionRequestExtras(runtime.model, getSessionId(ctx));
-	if (extras?.tools?.some((tool) => !tool || typeof tool !== "object" ||
-		(tool as { type?: unknown }).type !== "function" || (tool as { defer_loading?: unknown }).defer_loading)) {
-		return "unsupported-custom-or-deferred-tools";
-	}
-	// Our compact request does not carry Pi's grammar/deferred-tool option maps.
-	// Decline before writing a placeholder checkpoint when that context is needed.
-	if (ctx.sessionManager.buildSessionContext().messages.some((message) =>
-		(message.role === "toolResult" && message.addedToolNames?.length) ||
-		(message.role === "assistant" && message.content.some((block) => block.type === "toolCall" && block.namespace !== undefined)),
-	)) return "unsupported-custom-or-deferred-tools";
-	return undefined;
-}
-
-async function trySessionBeforeCompact(
+async function handleSessionBeforeCompact(
 	event: SessionBeforeCompactEvent,
 	ctx: ExtensionContext,
 	dependencies: ExtensionRuntimeDependencies,
-	nativeReplayRequired: boolean,
 ) {
 	const { config } = dependencies.loadExtensionConfig();
 	if (!config.enabled) {
@@ -472,17 +449,14 @@ async function trySessionBeforeCompact(
 	}
 
 	// Branch 1: Responses-family APIs use the native /responses/compact endpoint.
-	const { resolution, latestNativeCompaction } = await resolveNativeReplayEnvironment(ctx, config);
+	const resolution = await resolveNativeCompactionEnvironment(ctx, {
+		enabled: config.enabled,
+		responsesCompactApis: config.responsesCompactApis,
+	});
 	if (resolution.ok) {
-		// Continuity-break may restart a genuine text summary, never a damaged or
-		// mismatched native checkpoint reclassified as "latest-compaction-not-native".
-		if (nativeReplayRequired && !latestNativeCompaction?.ok) return { cancel: true };
-		const preflightFailure = nativeCompactionPreflight(event, ctx, resolution.runtime);
 		let responsesOutcome: ResponsesCompactOutcome;
-		if (preflightFailure) {
-			writeDebugArtifact("compaction-event", { event: "native-preflight-declined", reason: preflightFailure }, config, ctx);
-			responsesOutcome = { outcome: "failed" };
-		} else if (config.compactionVersion === "v2") {
+
+		if (config.compactionVersion === "v2") {
 			responsesOutcome = await runResponsesV2Compact(event, ctx, config, resolution.runtime, dependencies);
 		} else {
 			responsesOutcome = await runResponsesV1Compact(event, ctx, config, resolution.runtime, dependencies);
@@ -510,9 +484,6 @@ async function trySessionBeforeCompact(
 			ctx,
 		);
 	}
-
-	// Never summarize Pi's placeholder-only context over an existing native checkpoint.
-	if (nativeReplayRequired) return { cancel: true };
 
 	// Branch 2: run pi's native compaction method with the configured model.
 	const fallback = await dependencies.runNativeFallbackCompaction({
@@ -569,26 +540,7 @@ async function trySessionBeforeCompact(
 	return undefined;
 }
 
-async function resolveNativeReplayEnvironment(
-	ctx: ExtensionContext,
-	config: ExtensionConfig,
-	payload?: unknown,
-) {
-	const branchEntries = ctx.sessionManager.getBranch();
-	const resolution = await resolveNativeCompactionEnvironment(ctx, {
-		enabled: config.enabled,
-		responsesCompactApis: config.responsesCompactApis,
-	}, payload);
-	const latestNativeCompaction = resolution.ok ? resolveLatestNativeCompactionEntry(branchEntries, {
-		provider: resolution.runtime.provider,
-		api: resolution.runtime.api,
-		model: resolution.runtime.model,
-		baseUrl: resolution.runtime.baseUrl,
-	}) : undefined;
-	return { branchEntries, resolution, latestNativeCompaction };
-}
-
-async function tryBeforeProviderRequest(
+async function handleBeforeProviderRequest(
 	event: BeforeProviderRequestEvent,
 	ctx: ExtensionContext,
 	dependencies: ExtensionRuntimeDependencies,
@@ -604,8 +556,14 @@ async function tryBeforeProviderRequest(
 		rememberRequestContext(event.payload, getSessionId(ctx));
 	}
 
-	const replayEnvironment = await resolveNativeReplayEnvironment(ctx, config, event.payload);
-	const { resolution, branchEntries } = replayEnvironment;
+	const resolution = await resolveNativeCompactionEnvironment(
+		ctx,
+		{
+			enabled: config.enabled,
+			responsesCompactApis: config.responsesCompactApis,
+		},
+		event.payload,
+	);
 	if (resolution.ok === false) {
 		writeDebugArtifact(
 			"provider-request",
@@ -626,8 +584,13 @@ async function tryBeforeProviderRequest(
 	}
 
 	const runtime = resolution.runtime;
-	// A successful environment resolution always includes its strict identity match.
-	const latestNativeCompaction = replayEnvironment.latestNativeCompaction!;
+	const branchEntries = ctx.sessionManager.getBranch();
+	const latestNativeCompaction = resolveLatestNativeCompactionEntry(branchEntries, {
+		provider: runtime.provider,
+		api: runtime.api,
+		model: runtime.model,
+		baseUrl: runtime.baseUrl,
+	});
 	if (!latestNativeCompaction.ok) {
 		writeDebugArtifact(
 			"provider-request",
@@ -705,80 +668,6 @@ async function tryBeforeProviderRequest(
 	return rewrite.rewrittenPayload;
 }
 
-const NATIVE_REPLAY_BLOCKED_MESSAGE =
-	"Request cancelled to protect encrypted compaction history. Restore the checkpoint's provider/model and original OAuth endpoint, " +
-	"and re-enable pi-better-compaction if disabled. If replay still fails, use /tree to recover a branch before the native compaction; " +
-	"do not continue from the placeholder summary with another model.";
-
-function warnNativeReplayBlocked(ctx: ExtensionContext): void {
-	// Notification failure must not undo cancellation.
-	try { notifyWarning(ctx, NATIVE_REPLAY_BLOCKED_MESSAGE); } catch { /* best effort UI */ }
-}
-
-function abortNativeReplay(ctx: ExtensionContext): never {
-	// Pi's runner catches hook exceptions and returns the old payload. Abort the
-	// active Agent signal FIRST so the provider SDK cannot send that lossy payload.
-	ctx.abort();
-	warnNativeReplayBlocked(ctx);
-	throw new Error(`${EXTENSION_ID}: ${NATIVE_REPLAY_BLOCKED_MESSAGE}`);
-}
-
-async function handleContext(ctx: ExtensionContext, dependencies: ExtensionRuntimeDependencies) {
-	if (ctx.signal?.aborted) return;
-	let nativeReplayRequired = true;
-	let available = false;
-	try {
-		nativeReplayRequired = requiresNativeReplay(findLatestCompactionEntry(ctx.sessionManager.getBranch()));
-		if (!nativeReplayRequired) return;
-		const { config } = dependencies.loadExtensionConfig();
-		const environment = await resolveNativeReplayEnvironment(ctx, config);
-		available = environment.resolution.ok && environment.latestNativeCompaction?.ok === true;
-	} catch { /* Indeterminate native state is not permission to send a placeholder. */ }
-	// Google's SDK may invoke fetch after a late onPayload abort. Aborting in
-	// context makes its buildParams reject before transport construction instead.
-	if (nativeReplayRequired && !available) abortNativeReplay(ctx);
-}
-
-async function handleBeforeProviderRequest(
-	event: BeforeProviderRequestEvent,
-	ctx: ExtensionContext,
-	dependencies: ExtensionRuntimeDependencies,
-) {
-	if (ctx.signal?.aborted) return undefined;
-	// A failed branch read is indeterminate, not permission to send without state.
-	let nativeReplayRequired = true;
-	let payload: unknown;
-	try {
-		nativeReplayRequired = requiresNativeReplay(findLatestCompactionEntry(ctx.sessionManager.getBranch()));
-		// This check precedes disabled/unsupported provider/auth/payload early exits.
-		payload = await tryBeforeProviderRequest(event, ctx, dependencies);
-	} catch (error) {
-		if (nativeReplayRequired) abortNativeReplay(ctx);
-		throw error;
-	}
-	if (nativeReplayRequired && payload === undefined) abortNativeReplay(ctx);
-	return payload;
-}
-
-async function handleSessionBeforeCompact(
-	event: SessionBeforeCompactEvent,
-	ctx: ExtensionContext,
-	dependencies: ExtensionRuntimeDependencies,
-) {
-	let nativeReplayRequired = true;
-	try {
-		nativeReplayRequired = requiresNativeReplay(findLatestCompactionEntry(ctx.sessionManager.getBranch()));
-		const result = await trySessionBeforeCompact(event, ctx, dependencies, nativeReplayRequired);
-		if (!nativeReplayRequired || result?.compaction) return result;
-	} catch (error) {
-		if (!nativeReplayRequired) throw error;
-	}
-	warnNativeReplayBlocked(ctx);
-	// A thrown session_before_compact error is also swallowed by Pi's runner.
-	// Return its supported cancellation result instead of falling into Pi compact().
-	return { cancel: true };
-}
-
 export function registerExtensionRuntime(
 	pi: ExtensionAPI,
 	dependencies: ExtensionRuntimeDependencies = DEFAULT_DEPENDENCIES,
@@ -818,7 +707,6 @@ export function registerExtensionRuntime(
 	pi.on("session_before_compact", (event, ctx) =>
 		handleSessionBeforeCompact(event, ctx, dependencies),
 	);
-	pi.on("context", (_event, ctx) => handleContext(ctx, dependencies));
 	pi.on("before_provider_request", (event, ctx) =>
 		handleBeforeProviderRequest(event, ctx, dependencies),
 	);

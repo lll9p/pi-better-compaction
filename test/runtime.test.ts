@@ -37,6 +37,7 @@ describe("buildResponsesUrl", () => {
 describe("resolveNativeCompactionEnvironment", () => {
 	test("uses getApiKeyAndHeaders to resolve request auth", async () => {
 		const resolution = await resolveNativeCompactionEnvironment({
+			sessionManager: { getBranch: () => [] },
 			model: {
 				provider: "openai",
 				api: "openai-responses",
@@ -79,6 +80,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 
 	test("returns missing-api-key when request auth resolves without an api key", async () => {
 		const resolution = await resolveNativeCompactionEnvironment({
+			sessionManager: { getBranch: () => [] },
 			model: {
 				provider: "openai",
 				api: "openai-responses",
@@ -110,6 +112,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 
 	test("selects by API family: any provider speaking openai-responses qualifies by default", async () => {
 		const resolution = await resolveNativeCompactionEnvironment({
+			sessionManager: { getBranch: () => [] },
 			model: {
 				provider: "custom-litellm",
 				api: "openai-responses",
@@ -151,6 +154,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 
 	test("rejects non-Responses APIs so they take the native-method fallback path", async () => {
 		const resolution = await resolveNativeCompactionEnvironment({
+			sessionManager: { getBranch: () => [] },
 			model: {
 				provider: "anthropic",
 				api: "anthropic-messages",
@@ -177,6 +181,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 	test("honors responsesCompactApis narrowing from config", async () => {
 		const resolution = await resolveNativeCompactionEnvironment(
 			{
+				sessionManager: { getBranch: () => [] },
 				model: {
 					provider: "openai",
 					api: "openai-responses",
@@ -206,6 +211,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 
 	test("preserves resolved null header removals until model headers have been merged", async () => {
 		const resolution = await resolveNativeCompactionEnvironment({
+			sessionManager: { getBranch: () => [] },
 			model: {
 				provider: "openai",
 				api: "openai-responses",
@@ -247,9 +253,13 @@ describe("resolveNativeCompactionEnvironment", () => {
 
 	test("OAuth baseUrl overrides configuration for transport and native identity without mutating model", async () => {
 		const model = { provider: "github-copilot", api: "openai-responses", id: "gpt-6-astra", baseUrl: "https://api.individual.githubcopilot.com" };
-		const resolution = await resolveNativeCompactionEnvironment({ model, modelRegistry: {
-			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test", baseUrl: "https://api.enterprise.githubcopilot.com/", headers: { "x-oauth": "resolved" } }),
-		} } as any);
+		const resolution = await resolveNativeCompactionEnvironment({
+			model,
+			sessionManager: { getBranch: () => [] },
+			modelRegistry: {
+				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test", baseUrl: "https://api.enterprise.githubcopilot.com/", headers: { "x-oauth": "resolved" } }),
+			},
+		} as any);
 		expect(resolution.ok).toBe(true);
 		if (!resolution.ok) return;
 		expect(resolution.runtime.baseUrl).toBe("https://api.enterprise.githubcopilot.com");
@@ -258,5 +268,27 @@ describe("resolveNativeCompactionEnvironment", () => {
 		expect(resolution.runtime.currentModel.baseUrl).toBe(resolution.runtime.baseUrl);
 		expect(model.baseUrl).toBe("https://api.individual.githubcopilot.com");
 		expect(toHeaders(resolution.runtime)["x-oauth"]).toBe("resolved");
+	});
+
+	test("resolves OAuth transport from the session model when ctx.model is absent", async () => {
+		const model = { provider: "github-copilot", api: "openai-responses", id: "gpt-6-astra", baseUrl: "https://api.individual.githubcopilot.com" };
+		const resolution = await resolveNativeCompactionEnvironment({
+			sessionManager: { getBranch: () => [{ type: "model_change", provider: model.provider, modelId: model.id }] },
+			modelRegistry: {
+				find: (provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined,
+				getApiKeyAndHeaders: async (currentModel: unknown) => {
+					expect(currentModel).toBe(model);
+					return { ok: true, apiKey: "test", baseUrl: "https://api.business.githubcopilot.com" };
+				},
+			},
+		} as any);
+		expect(resolution).toMatchObject({
+			ok: true,
+			runtime: {
+				model: model.id,
+				baseUrl: "https://api.business.githubcopilot.com",
+				responsesUrl: "https://api.business.githubcopilot.com/responses",
+			},
+		});
 	});
 });
