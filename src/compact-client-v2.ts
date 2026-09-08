@@ -308,6 +308,7 @@ export async function executeV2Compaction(
 	const requestBody = {
 		...request,
 		input: [...request.input, { type: "compaction_trigger" }],
+		store: false,
 		stream: true,
 	};
 
