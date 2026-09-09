@@ -109,7 +109,7 @@ describe("executeV2Compaction", () => {
 		}
 	});
 
-	test("appends compaction_trigger to the request input and sets stream: true", async () => {
+	test("appends compaction_trigger and disables response storage", async () => {
 		let requestBody: Record<string, unknown> = {};
 		globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
 			requestBody = JSON.parse(String(init?.body));
@@ -126,6 +126,7 @@ describe("executeV2Compaction", () => {
 		});
 
 		expect(requestBody.stream).toBe(true);
+		expect(requestBody.store).toBe(false);
 		const input = requestBody.input as unknown[];
 		expect(input[input.length - 1]).toEqual({ type: "compaction_trigger" });
 		expect(input.length).toBe(2); // original + compaction_trigger
