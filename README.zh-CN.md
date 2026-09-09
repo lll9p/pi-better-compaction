@@ -44,10 +44,6 @@ cd pi-better-compaction && pi install .
 ```jsonc
 {
   "enabled": true,
-  "midRun": {
-    "enabled": false,
-    "thresholdPercent": 80
-  },
   "compactionVersion": "v2",
   "compactionModel": null,
   "compactionThinkingLevel": "off",
@@ -69,8 +65,6 @@ cd pi-better-compaction && pi install .
 | 选项 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `enabled` | `boolean` | `true` | 总开关。设为 `false` 完全禁用扩展。 |
-| `midRun.enabled` | `boolean` | `false` | 保留配置，当前会被忽略。即使设为 `true`，mid-run guard 仍保持禁用。 |
-| `midRun.thresholdPercent` | `number` | `80` | 已禁用的 mid-run guard 的保留阈值。必须大于 0 且不超过 100。 |
 | `compactionVersion` | `"v1" \| "v2"` | `"v2"` | Responses 系列 API 的压缩协议。**V2**（流式，加密 blob）是 OpenAI 当前默认协议；**V1** 使用旧版 `/responses/compact` 端点。 |
 | `compactionModel` | `string \| null` | `null` | 回退压缩使用的模型（用于非 Responses API，或原生压缩失败时）。格式：`"provider/model-id"`，如 `"openai/gpt-5.1-mini"`。`null` = 由 pi 使用当前对话模型。 |
 | `compactionThinkingLevel` | `string` | `"off"` | 回退压缩模型的思考级别。可选：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`。 |

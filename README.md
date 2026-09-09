@@ -44,10 +44,6 @@ If the file doesn't exist, all defaults apply. The extension never creates this 
 ```jsonc
 {
   "enabled": true,
-  "midRun": {
-    "enabled": false,
-    "thresholdPercent": 80
-  },
   "compactionVersion": "v2",
   "compactionModel": null,
   "compactionThinkingLevel": "off",
@@ -69,8 +65,6 @@ If the file doesn't exist, all defaults apply. The extension never creates this 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | `boolean` | `true` | Master switch. Set `false` to disable the extension entirely. |
-| `midRun.enabled` | `boolean` | `false` | Reserved and currently ignored. The mid-run guard remains disabled even when set to `true`. |
-| `midRun.thresholdPercent` | `number` | `80` | Reserved threshold for the disabled mid-run guard. Must be greater than 0 and at most 100. |
 | `compactionVersion` | `"v1" \| "v2"` | `"v2"` | Protocol for Responses-family APIs. **V2** (streaming, encrypted blob) is the current OpenAI default. **V1** uses the legacy `/responses/compact` endpoint. |
 | `compactionModel` | `string \| null` | `null` | Model for fallback compaction (non-Responses APIs, or when native compact fails). Format: `"provider/model-id"`, e.g. `"openai/gpt-5.1-mini"`. `null` = let pi use the current chat model. |
 | `compactionThinkingLevel` | `string` | `"off"` | Thinking level for the fallback compaction model. One of: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. |

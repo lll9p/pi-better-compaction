@@ -671,7 +671,6 @@ export function registerExtensionRuntime(
 	pi: ExtensionAPI,
 	dependencies: ExtensionRuntimeDependencies = DEFAULT_DEPENDENCIES,
 ): void {
-	// Mid-run compaction is intentionally disabled regardless of config.
 	pi.on("session_start", (_event, ctx) => {
 		const { config, source, warnings } = dependencies.loadExtensionConfig();
 		if (!config.enabled) return;
