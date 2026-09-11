@@ -125,7 +125,7 @@ async function collectStreamOutput(response: Response, signal?: AbortSignal): Pr
 	let buffer = "";
 
 	try {
-		while (true) {
+		stream: while (true) {
 			if (signal?.aborted) {
 				reader.cancel();
 				return { ok: false, reason: "aborted" as const };
@@ -178,7 +178,7 @@ async function collectStreamOutput(response: Response, signal?: AbortSignal): Pr
 							usage = resp.usage as V2CompactionUsage;
 						}
 					}
-					continue;
+					break stream;
 				}
 
 				if (eventType === "response.failed" || eventType === "error") {
@@ -186,16 +186,18 @@ async function collectStreamOutput(response: Response, signal?: AbortSignal): Pr
 					serverError = isRecord(errorObj)
 						? (typeof errorObj.message === "string" ? errorObj.message : JSON.stringify(errorObj))
 						: String(errorObj);
-					continue;
+					break stream;
 				}
 			}
 		}
 	} catch (error) {
-		if (isAbortError(error)) {
+		if (signal?.aborted || isAbortError(error)) {
 			return { ok: false, reason: "aborted" as const };
 		}
 		return { ok: false, reason: "stream-parse-error", errorMessage: error instanceof Error ? error.message : String(error) };
 	} finally {
+		// Completion is terminal even when a gateway keeps the HTTP body open.
+		try { await reader.cancel(); } catch { /* noop */ }
 		try { reader.releaseLock(); } catch { /* noop */ }
 	}
 
@@ -239,7 +241,7 @@ async function executeV2Attempt(
 			signal,
 		});
 	} catch (error) {
-		if (isAbortError(error)) {
+		if (signal?.aborted || isAbortError(error)) {
 			return { failure: { ok: false, reason: "aborted" } };
 		}
 		return {
@@ -309,7 +311,9 @@ function isRetryable(result: V2CompactionFailure): boolean {
 export async function executeV2Compaction(
 	options: ExecuteV2CompactionOptions,
 ): Promise<V2CompactionResult> {
-	const { runtime, request, signal, settings, context } = options;
+	const { runtime, request, settings, context } = options;
+	const deadline = AbortSignal.timeout(600_000);
+	const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
 	const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
 
 	const headers = toHeaders(runtime, SSE_ACCEPT, request.input);

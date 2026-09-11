@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { executeV2Compaction, type V2CompactionResult } from "./compact-client-v2";
 import { buildResponsesUrl } from "./runtime";
 
@@ -107,6 +107,28 @@ describe("executeV2Compaction", () => {
 			expect(result.usage).toEqual({ input_tokens: 1000, output_tokens: 200, total_tokens: 1200 });
 			expect(result.createdAt).toBeDefined();
 		}
+	});
+
+	test.each([responseCompleted(), { type: "response.failed", error: { message: "failed" } }])("stops on terminal SSE event %j without waiting for HTTP EOF", async (terminal) => {
+		let cancelled = false;
+		globalThis.fetch = mock(async () => new Response(new ReadableStream({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode(sseBody([compactionOutputItemDone("blob"), terminal])));
+			},
+			cancel() { cancelled = true; },
+		}))) as typeof fetch;
+		const result = await executeV2Compaction({ runtime: createRuntime(), request: createRequest(), maxRetries: 0 });
+		expect(result.ok).toBe(terminal.type === "response.completed");
+		expect(cancelled).toBe(true);
+	}, 1000);
+
+	test("uses a 600-second deadline and does not fetch after it expires", async () => {
+		const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(AbortSignal.abort(new DOMException("expired", "TimeoutError")));
+		const fetch = mock(async () => sseResponse([]));
+		globalThis.fetch = fetch as typeof globalThis.fetch;
+		expect(await executeV2Compaction({ runtime: createRuntime(), request: createRequest() })).toEqual({ ok: false, reason: "aborted" });
+		expect(timeout).toHaveBeenCalledWith(600_000);
+		expect(fetch).not.toHaveBeenCalled();
 	});
 
 	test("appends compaction_trigger and disables response storage", async () => {
