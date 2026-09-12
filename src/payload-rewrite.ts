@@ -253,6 +253,7 @@ function alignPrunedInput(actual: readonly unknown[], expected: readonly unknown
 				indices.push(index);
 				actualIndex++;
 			}
+			if (outputs.size > 0) return undefined;
 		} else {
 			if (!areEquivalentValues(actual[actualIndex], item)) return undefined;
 			indices.push(expectedIndex++);
