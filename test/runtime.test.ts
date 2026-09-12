@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildResponsesUrl, resolveNativeCompactionEnvironment } from "../src/runtime";
+import { toHeaders } from "../src/shared-headers";
 
 describe("buildResponsesUrl", () => {
 	test("builds openai responses URL", () => {
@@ -208,7 +209,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 		});
 	});
 
-	test("filters null-valued headers from ProviderHeaders", async () => {
+	test("passes null-valued headers through for downstream toHeaders processing", async () => {
 		const resolution = await resolveNativeCompactionEnvironment({
 			model: {
 				provider: "openai",
@@ -238,9 +239,17 @@ describe("resolveNativeCompactionEnvironment", () => {
 				apiKey: "sk-openai",
 				headers: {
 					"x-keep": "yes",
+					"x-remove": null,
 					"x-also-keep": "ok",
 				},
 			}),
 		});
+		// Verify toHeaders correctly strips nulls
+		if (resolution.ok) {
+			const headers = toHeaders(resolution.runtime);
+			expect(headers["x-keep"]).toBe("yes");
+			expect(headers["x-also-keep"]).toBe("ok");
+			expect(headers["x-remove"]).toBeUndefined();
+		}
 	});
 });

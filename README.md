@@ -4,7 +4,7 @@ English | [中文](README.zh-CN.md)
 
 A [pi](https://github.com/nicepkg/pi) extension that upgrades context compaction with two coordinated strategies:
 
-1. **OpenAI Responses APIs** use the provider's native compaction endpoint, preserving opaque context that plain text summaries lose.
+1. **OpenAI Responses APIs**, including supported GitHub Copilot models, use the provider's native compaction endpoint, preserving opaque context that plain text summaries lose.
 2. **All other APIs** (Anthropic, Gemini, etc.) can run pi's built-in compaction with a **dedicated cheaper/faster model**, so summarization doesn't consume quota on your primary model.
 
 Everything fails open — if any step cannot proceed, pi's default compaction takes over.

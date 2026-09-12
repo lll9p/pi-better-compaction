@@ -39,7 +39,7 @@ export type NativeCompactionRuntime = {
 	model: string;
 	baseUrl: string;
 	apiKey: string;
-	headers?: Record<string, string>;
+	headers?: Record<string, string | null>;
 	compactPath: string;
 	compactUrl: string;
 	responsesUrl: string;
@@ -127,25 +127,13 @@ export function buildCompactPath(api: ResponsesCompactApi): string {
 	return api === "openai-codex-responses" ? CODEX_COMPACT_PATH : OPENAI_COMPACT_PATH;
 }
 
-/** Strip null-valued entries so downstream consumers receive a clean Record<string, string>. */
-function filterNullHeaders(headers: Record<string, string | null> | undefined): Record<string, string> | undefined {
-	if (!headers) return undefined;
-	const filtered: Record<string, string> = {};
-	for (const [key, value] of Object.entries(headers)) {
-		if (value !== null) {
-			filtered[key] = value;
-		}
-	}
-	return Object.keys(filtered).length > 0 ? filtered : undefined;
-}
-
 async function resolveRequestAuth(
 	ctx: ExtensionContext,
 	model: RuntimeModel,
-): Promise<{ apiKey?: string; headers?: Record<string, string> }> {
+): Promise<{ apiKey?: string; headers?: Record<string, string | null>; baseUrl?: string }> {
 	const modelRegistry = ctx.modelRegistry as {
 		getApiKeyAndHeaders?: (currentModel: RuntimeModel) => Promise<
-			| { ok: true; apiKey?: string; headers?: Record<string, string | null> }
+			| { ok: true; apiKey?: string; headers?: Record<string, string | null>; baseUrl?: string }
 			| { ok: false; error: string }
 		>;
 	};
@@ -155,7 +143,7 @@ async function resolveRequestAuth(
 	}
 
 	const auth = await modelRegistry.getApiKeyAndHeaders(model);
-	return auth.ok ? { apiKey: auth.apiKey, headers: filterNullHeaders(auth.headers) } : {};
+	return auth.ok ? { apiKey: auth.apiKey, headers: auth.headers, baseUrl: auth.baseUrl } : {};
 }
 
 export function isSupportedApi(api: string): api is ResponsesCompactApi {
@@ -232,14 +220,6 @@ export async function resolveNativeCompactionEnvironment(
 		};
 	}
 
-	if (!descriptor.baseUrl) {
-		return {
-			ok: false,
-			reason: "missing-base-url",
-			...descriptor,
-		};
-	}
-
 	let requestPayload: ResponsesCompatibleRequestPayload | undefined;
 	if (payload !== undefined) {
 		if (!isResponsesCompatiblePayload(payload)) {
@@ -261,7 +241,13 @@ export async function resolveNativeCompactionEnvironment(
 		requestPayload = payload;
 	}
 
-	const { apiKey, headers } = await resolveRequestAuth(ctx, currentModel);
+	const { apiKey, headers, baseUrl: authBaseUrl } = await resolveRequestAuth(ctx, currentModel);
+	// OAuth can route a configured Individual model to an Enterprise endpoint.
+	// Use the same resolved endpoint for transport AND persisted replay identity.
+	const baseUrl = normalizeBaseUrl(authBaseUrl) ?? descriptor.baseUrl;
+	if (!baseUrl) {
+		return { ok: false, reason: "missing-base-url", ...descriptor };
+	}
 	if (!apiKey) {
 		return {
 			ok: false,
@@ -276,14 +262,14 @@ export async function resolveNativeCompactionEnvironment(
 			provider: descriptor.provider,
 			api: descriptor.api,
 			model: descriptor.model,
-			baseUrl: descriptor.baseUrl,
+			baseUrl,
 			apiKey,
 			headers,
 			compactPath: buildCompactPath(descriptor.api),
-			compactUrl: buildCompactUrl(descriptor.baseUrl, descriptor.api),
-			responsesUrl: buildResponsesUrl(descriptor.baseUrl, descriptor.api),
+			compactUrl: buildCompactUrl(baseUrl, descriptor.api),
+			responsesUrl: buildResponsesUrl(baseUrl, descriptor.api),
 			payload: requestPayload,
-			currentModel,
+			currentModel: { ...currentModel, baseUrl },
 		},
 	};
 }

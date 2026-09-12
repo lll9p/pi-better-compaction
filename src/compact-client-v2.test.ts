@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { executeV2Compaction, type V2CompactionResult } from "./compact-client-v2";
 import { buildResponsesUrl } from "./runtime";
 
@@ -107,6 +107,28 @@ describe("executeV2Compaction", () => {
 			expect(result.usage).toEqual({ input_tokens: 1000, output_tokens: 200, total_tokens: 1200 });
 			expect(result.createdAt).toBeDefined();
 		}
+	});
+
+	test.each([responseCompleted(), { type: "response.failed", error: { message: "failed" } }])("stops on terminal SSE event %j without waiting for HTTP EOF", async (terminal) => {
+		let cancelled = false;
+		globalThis.fetch = mock(async () => new Response(new ReadableStream({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode(sseBody([compactionOutputItemDone("blob"), terminal])));
+			},
+			cancel() { cancelled = true; },
+		}))) as typeof fetch;
+		const result = await executeV2Compaction({ runtime: createRuntime(), request: createRequest(), maxRetries: 0 });
+		expect(result.ok).toBe(terminal.type === "response.completed");
+		expect(cancelled).toBe(true);
+	}, 1000);
+
+	test("uses a 600-second deadline and does not fetch after it expires", async () => {
+		const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(AbortSignal.abort(new DOMException("expired", "TimeoutError")));
+		const fetch = mock(async () => sseResponse([]));
+		globalThis.fetch = fetch as typeof globalThis.fetch;
+		expect(await executeV2Compaction({ runtime: createRuntime(), request: createRequest() })).toEqual({ ok: false, reason: "aborted" });
+		expect(timeout).toHaveBeenCalledWith(600_000);
+		expect(fetch).not.toHaveBeenCalled();
 	});
 
 	test("appends compaction_trigger and disables response storage", async () => {
@@ -550,5 +572,53 @@ describe("executeV2Compaction", () => {
 		expect(fetchHeaders?.get("chatgpt-account-id")).toBe("acct_456");
 		expect(fetchHeaders?.get("originator")).toBe("pi");
 		expect(fetchHeaders?.get("openai-beta")).toBe("responses=experimental");
+	});
+});
+
+describe("Copilot V2 transport", () => {
+	test("uses Copilot ceiling and dynamic headers with resolved auth precedence", async () => {
+		let body: Record<string, any> = {};
+		let headers = new Headers();
+		globalThis.fetch = mock(async (_url, init) => {
+			body = JSON.parse(String(init?.body));
+			headers = new Headers(init?.headers);
+			return sseResponse([compactionOutputItemDone("blob"), responseCompleted()]);
+		}) as typeof fetch;
+		const request = createRequest([{ role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,test", detail: "auto" }] }]);
+		const result = await executeV2Compaction({
+			runtime: createRuntime({
+				provider: "github-copilot",
+				headers: { Authorization: "Bearer resolved", "x-remove": null },
+				currentModel: { ...baseModel, headers: { authorization: "Bearer stale", "x-remove": "stale" } },
+			}),
+			request,
+			maxRetries: 0,
+		});
+		expect(result.ok).toBe(true);
+		expect(body.max_output_tokens).toBe(20000);
+		expect(body.store).toBe(false);
+		expect(body.stream).toBe(true);
+		expect(body.context_management).toBeUndefined();
+		expect(body.input.at(-1)).toEqual({ type: "compaction_trigger" });
+		expect(headers.get("authorization")).toBe("Bearer resolved");
+		expect(headers.get("x-remove")).toBeNull();
+		expect(headers.get("x-initiator")).toBe("agent");
+		expect(headers.get("openai-intent")).toBe("conversation-edits");
+		expect(headers.get("copilot-vision-request")).toBe("true");
+		expect(request.input).toHaveLength(1);
+	});
+
+	test("preserves disabled storage without adding Copilot settings for other Responses providers", async () => {
+		globalThis.fetch = mock(async (_url, init) => {
+			const body = JSON.parse(String(init?.body));
+			const headers = new Headers(init?.headers);
+			expect(body.store).toBe(false);
+			expect(body.max_output_tokens).toBeUndefined();
+			expect(headers.get("x-initiator")).toBeNull();
+			expect(headers.get("openai-intent")).toBeNull();
+			expect(headers.get("copilot-vision-request")).toBeNull();
+			return sseResponse([compactionOutputItemDone("blob"), responseCompleted()]);
+		}) as typeof fetch;
+		expect((await executeV2Compaction({ runtime: createRuntime(), request: createRequest() })).ok).toBe(true);
 	});
 });

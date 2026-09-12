@@ -262,6 +262,7 @@ function createContext(args: {
 	systemPrompt?: string;
 	sessionContextMessages?: Record<string, unknown>[];
 	registryModels?: Array<{ provider: string; id: string }>;
+	authBaseUrl?: string;
 } = {}) {
 	const branchEntries = args.branchEntries ?? [];
 	const model = args.model ?? defaultModel;
@@ -275,7 +276,7 @@ function createContext(args: {
 		modelRegistry: {
 			find: (provider: string, modelId: string) =>
 				(args.registryModels ?? []).find((entry) => entry.provider === provider && entry.id === modelId),
-			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "sk-test-native-compaction" }),
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "sk-test-native-compaction", baseUrl: args.authBaseUrl }),
 		},
 		sessionManager: {
 			getBranch: () => branchEntries,
@@ -1256,4 +1257,48 @@ test("V2 abort cancels without fallback", async () => {
 	expect(compactCalls).toHaveLength(0);
 	expect(fallbackCalls).toHaveLength(0);
 	expect(result.cancel).toBe(true);
+});
+
+test("Copilot persists resolved OAuth identity and replays compatible signed history after reload", async () => {
+	const model = { ...defaultModel, provider: "github-copilot", id: "gpt-6-astra", baseUrl: "https://api.individual.githubcopilot.com" };
+	const authBaseUrl = "https://api.enterprise.githubcopilot.com";
+	const user = createUserEntry("copilot-user", "Record the code from the assistant.");
+	// Same-model signed history is supported by the upstream local serializer.
+	const assistant = createAssistantEntry("copilot-fact", [createTextBlock("code=assistant-only-fact", "final_answer", "msg_copilot_fact")], model);
+	const branchEntries = [user, assistant];
+	const { sessionBeforeCompact, v2CompactCalls } = await loadHookHarness({
+		v2CompactResult: { ok: true, compactionItem: { type: "compaction", encrypted_content: "test-opaque-state" } },
+	});
+	const result = await sessionBeforeCompact({
+		preparation: { messagesToSummarize: [user.message], turnPrefixMessages: [], firstKeptEntryId: user.id, tokensBefore: 400 },
+		signal: new AbortController().signal,
+	}, createContext({ branchEntries, model, authBaseUrl })) as any;
+	expect(result.compaction.details.baseUrl).toBe(authBaseUrl);
+	expect((v2CompactCalls[0].runtime as any).responsesUrl).toBe(`${authBaseUrl}/responses`);
+	// Model a persisted checkpoint / reload without writing any session file.
+	const checkpoint = JSON.parse(JSON.stringify({ type: "compaction", id: "copilot-checkpoint", timestamp: nextTimestamp(), ...result.compaction }));
+	const tail = createUserEntry("copilot-tail", "What was the code? Also retain this new tail.");
+	branchEntries.push(checkpoint, tail);
+	const payload = await buildPiReplayPayload({ model, branchEntries, compactionEntry: checkpoint, instructions: "fresh", freshPreamble: "fresh" });
+	const reloaded = await loadHookHarness();
+	const rewritten = await reloaded.beforeProviderRequest({ payload }, createContext({ branchEntries, model, authBaseUrl })) as any;
+	expect(rewritten.input).toContainEqual({ type: "compaction", encrypted_content: "test-opaque-state" });
+	expect(JSON.stringify(rewritten)).not.toContain("assistant-only-fact");
+	const blobIndex = rewritten.input.findIndex((item: any) => item.type === "compaction");
+	expect(JSON.stringify(rewritten.input.slice(blobIndex + 1))).toContain("Also retain this new tail");
+	const staleContext = createContext({ branchEntries, model, authBaseUrl: "https://api.business.githubcopilot.com" });
+	const originalPayload = JSON.stringify(payload);
+	// Preserve upstream fail-open behavior without replaying a blob at the wrong endpoint.
+	expect(await reloaded.beforeProviderRequest({ payload }, staleContext)).toBeUndefined();
+	expect(JSON.stringify(payload)).toBe(originalPayload);
+	// A subsequent compaction uses the stored blob and only the post-checkpoint tail.
+	await reloaded.sessionBeforeCompact({
+		preparation: { messagesToSummarize: [], turnPrefixMessages: [], firstKeptEntryId: user.id, tokensBefore: 400 },
+		signal: new AbortController().signal,
+	}, createContext({ branchEntries, model, authBaseUrl }));
+	const nextRequest = reloaded.v2CompactCalls[0].request as any;
+	expect(nextRequest.input[0]).toEqual({ role: "user", content: [{ type: "input_text", text: "Record the code from the assistant." }] });
+	expect(JSON.stringify(nextRequest.input)).not.toContain("assistant-only-fact");
+	expect(nextRequest.input).toContainEqual({ type: "compaction", encrypted_content: "test-opaque-state" });
+	expect(JSON.stringify(nextRequest.input.at(-1))).toContain("Also retain this new tail");
 });

@@ -67,6 +67,8 @@ export type ExecuteV2CompactionOptions = {
 
 const DEFAULT_MAX_RETRIES = 2;
 const SSE_ACCEPT = "text/event-stream";
+// Copilot rejects compaction_trigger with a smaller explicit output ceiling.
+const COPILOT_COMPACTION_OUTPUT_CEILING = 20_000;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -123,7 +125,7 @@ async function collectStreamOutput(response: Response, signal?: AbortSignal): Pr
 	let buffer = "";
 
 	try {
-		while (true) {
+		stream: while (true) {
 			if (signal?.aborted) {
 				reader.cancel();
 				return { ok: false, reason: "aborted" as const };
@@ -176,7 +178,7 @@ async function collectStreamOutput(response: Response, signal?: AbortSignal): Pr
 							usage = resp.usage as V2CompactionUsage;
 						}
 					}
-					continue;
+					break stream;
 				}
 
 				if (eventType === "response.failed" || eventType === "error") {
@@ -184,16 +186,18 @@ async function collectStreamOutput(response: Response, signal?: AbortSignal): Pr
 					serverError = isRecord(errorObj)
 						? (typeof errorObj.message === "string" ? errorObj.message : JSON.stringify(errorObj))
 						: String(errorObj);
-					continue;
+					break stream;
 				}
 			}
 		}
 	} catch (error) {
-		if (isAbortError(error)) {
+		if (signal?.aborted || isAbortError(error)) {
 			return { ok: false, reason: "aborted" as const };
 		}
 		return { ok: false, reason: "stream-parse-error", errorMessage: error instanceof Error ? error.message : String(error) };
 	} finally {
+		// Completion is terminal even when a gateway keeps the HTTP body open.
+		try { await reader.cancel(); } catch { /* noop */ }
 		try { reader.releaseLock(); } catch { /* noop */ }
 	}
 
@@ -237,7 +241,7 @@ async function executeV2Attempt(
 			signal,
 		});
 	} catch (error) {
-		if (isAbortError(error)) {
+		if (signal?.aborted || isAbortError(error)) {
 			return { failure: { ok: false, reason: "aborted" } };
 		}
 		return {
@@ -294,14 +298,25 @@ function isRetryable(result: V2CompactionFailure): boolean {
  * to the input, streams the SSE response, and collects the compaction blob.
  *
  * Retries recoverable failures up to `maxRetries` times (default 2).
+ *
+ * Copilot routes in Pi 0.84.4; tested means live native compaction and replay.
+ *
+ * | Provider (via Copilot) | API | Tested |
+ * | --- | --- | --- |
+ * | OpenAI (Astra) | Responses | Yes |
+ * | xAI (Grok 4.6) | Responses | Failed (HTTP 422) |
+ * | Google (Gemini) | Chat Completions | No; outside this path |
+ * | Anthropic (Opus) | Messages | No; outside this path |
  */
 export async function executeV2Compaction(
 	options: ExecuteV2CompactionOptions,
 ): Promise<V2CompactionResult> {
-	const { runtime, request, signal, settings, context } = options;
+	const { runtime, request, settings, context } = options;
+	const deadline = AbortSignal.timeout(600_000);
+	const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
 	const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
 
-	const headers = toHeaders(runtime, SSE_ACCEPT);
+	const headers = toHeaders(runtime, SSE_ACCEPT, request.input);
 	const url = runtime.responsesUrl;
 
 	// Build request body: input + compaction_trigger, stream=true.
@@ -310,6 +325,9 @@ export async function executeV2Compaction(
 		input: [...request.input, { type: "compaction_trigger" }],
 		store: false,
 		stream: true,
+		...(runtime.provider === "github-copilot" ? {
+			max_output_tokens: COPILOT_COMPACTION_OUTPUT_CEILING,
+		} : {}),
 	};
 
 	let lastFailure: V2CompactionFailure | undefined;
