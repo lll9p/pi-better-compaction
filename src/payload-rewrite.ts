@@ -227,6 +227,41 @@ function areEquivalentValues(left: unknown, right: unknown): boolean {
 	return false;
 }
 
+// Match pruned output runs by call ID; all other items must stay unchanged. -- PI/gpt-6-astra
+function alignPrunedInput(actual: readonly unknown[], expected: readonly unknown[]): number[] | undefined {
+	const indices: number[] = [];
+	let actualIndex = 0;
+	for (let expectedIndex = 0; expectedIndex < expected.length;) {
+		const item = expected[expectedIndex];
+		if (isRecord(item) && item.type === "function_call_output") {
+			const outputs = new Map<string, number>();
+			while (expectedIndex < expected.length) {
+				const output = expected[expectedIndex];
+				if (!isRecord(output) || output.type !== "function_call_output") break;
+				if (typeof output.call_id !== "string" || outputs.has(output.call_id)) return undefined;
+				outputs.set(output.call_id, expectedIndex++);
+			}
+			while (actualIndex < actual.length) {
+				const output = actual[actualIndex];
+				if (!isRecord(output) || output.type !== "function_call_output") break;
+				const index = typeof output.call_id === "string" ? outputs.get(output.call_id) : undefined;
+				if (index === undefined || !areEquivalentValues(
+					{ ...output, output: undefined },
+					{ ...(expected[index] as Record<string, unknown>), output: undefined },
+				)) return undefined;
+				outputs.delete(output.call_id as string);
+				indices.push(index);
+				actualIndex++;
+			}
+		} else {
+			if (!areEquivalentValues(actual[actualIndex], item)) return undefined;
+			indices.push(expectedIndex++);
+			actualIndex++;
+		}
+	}
+	return actualIndex === actual.length ? indices : undefined;
+}
+
 function toBranchSummaryMessage(entry: BranchSummaryEntry): AgentMessage {
 	return {
 		role: "branchSummary",
@@ -449,7 +484,8 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		...freshPreamble.trailingInput,
 	];
 
-	if (!areEquivalentValues(args.payload.input, originalPiReplayInput)) {
+	const originalIndices = alignPrunedInput(args.payload.input, originalPiReplayInput);
+	if (!originalIndices) {
 		const parity = compareResponsesInputParity(args.payload.input, originalPiReplayInput);
 		return {
 			ok: false,
@@ -467,17 +503,13 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 	const compactionSummaryCount = serializeMessagesToResponsesInput(args.model, [compactionSummaryMessage]).length;
 	const preCompactionKeptCount = serializeMessagesToResponsesInput(args.model, preCompactionKeptMessages).length;
 	const tailStartIndex = freshPreambleCount + compactionSummaryCount + preCompactionKeptCount;
-	const tailEndIndex = args.payload.input.length - trailingPreambleCount;
-	const actualCompactionSummary = cloneResponsesInputSlice(
-		args.payload.input.slice(freshPreambleCount, freshPreambleCount + compactionSummaryCount),
+	const tailEndIndex = originalPiReplayInput.length - trailingPreambleCount;
+	const actualSlice = (start: number, end: number) => cloneResponsesInputSlice(
+		args.payload.input.filter((_, index) => originalIndices[index] >= start && originalIndices[index] < end),
 	);
-	const actualPreCompactionKeptWindow = cloneResponsesInputSlice(
-		args.payload.input.slice(
-			freshPreambleCount + compactionSummaryCount,
-			freshPreambleCount + compactionSummaryCount + preCompactionKeptCount,
-		),
-	);
-	const actualPostCompactionTail = cloneResponsesInputSlice(args.payload.input.slice(tailStartIndex, tailEndIndex));
+	const actualCompactionSummary = actualSlice(freshPreambleCount, freshPreambleCount + compactionSummaryCount);
+	const actualPreCompactionKeptWindow = actualSlice(freshPreambleCount + compactionSummaryCount, tailStartIndex);
+	const actualPostCompactionTail = actualSlice(tailStartIndex, tailEndIndex);
 	if (!actualCompactionSummary || !actualPreCompactionKeptWindow || !actualPostCompactionTail) {
 		return {
 			ok: false,
