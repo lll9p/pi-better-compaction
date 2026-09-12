@@ -228,7 +228,8 @@ function areEquivalentValues(left: unknown, right: unknown): boolean {
 }
 
 // Match pruned output runs by call ID; all other items must stay unchanged. -- PI/gpt-6-astra
-function alignPrunedInput(actual: readonly unknown[], expected: readonly unknown[]): number[] | undefined {
+/** @internal — exported for unit testing only */
+export function alignPrunedInput(actual: readonly unknown[], expected: readonly unknown[]): number[] | undefined {
 	const indices: number[] = [];
 	let actualIndex = 0;
 	for (let expectedIndex = 0; expectedIndex < expected.length;) {

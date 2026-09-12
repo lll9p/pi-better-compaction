@@ -56,6 +56,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 					};
 				},
 			},
+			sessionManager: { getBranch: () => [] },
 		} as any);
 
 		expect(resolution).toEqual({
@@ -95,6 +96,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 					};
 				},
 			},
+			sessionManager: { getBranch: () => [] },
 		} as any);
 
 		expect(resolution).toEqual({
@@ -129,6 +131,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 					};
 				},
 			},
+			sessionManager: { getBranch: () => [] },
 		} as any);
 
 		expect(resolution).toEqual({
@@ -161,6 +164,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 					return { ok: true, apiKey: "sk-ant" };
 				},
 			},
+			sessionManager: { getBranch: () => [] },
 		} as any);
 
 		expect(resolution).toEqual({
@@ -187,6 +191,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 						return { ok: true, apiKey: "sk-openai" };
 					},
 				},
+				sessionManager: { getBranch: () => [] },
 			} as any,
 			{
 				responsesCompactApis: ["openai-codex-responses"],
@@ -224,6 +229,7 @@ describe("resolveNativeCompactionEnvironment", () => {
 					};
 				},
 			},
+			sessionManager: { getBranch: () => [] },
 		} as any);
 
 		expect(resolution).toEqual({

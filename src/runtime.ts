@@ -202,7 +202,7 @@ export async function resolveNativeCompactionEnvironment(
 	}
 
 	let sessionModel: RuntimeModel | undefined;
-	const branch = ctx.sessionManager.getBranch();
+	const branch = ctx.sessionManager?.getBranch?.() ?? [];
 	for (let index = branch.length - 1; index >= 0; index -= 1) {
 		const entry = branch[index];
 		if (entry?.type === "model_change") {
