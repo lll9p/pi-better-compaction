@@ -548,6 +548,7 @@ async function runAnthropicCompact(
 			...identity,
 			compactResponseId: result.messageId,
 			priorBlockReplayed: Boolean(priorReplay),
+			retriedWithoutThinking: Boolean(result.retriedWithoutThinking),
 			summarizedMessages: messages.length,
 			firstKeptEntryId: event.preparation.firstKeptEntryId,
 		},

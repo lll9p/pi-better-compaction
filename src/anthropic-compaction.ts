@@ -104,7 +104,7 @@ export function replaceSummaryWithBlock(
 /** Turn Pi's serialized request into an on-demand summary request. */
 export function buildCompactionPayload(
 	payload: unknown,
-	options: { priorReplay?: AnthropicReplay; instructions?: string; tools?: unknown[] },
+	options: { priorReplay?: AnthropicReplay; instructions?: string; tools?: unknown[]; omitThinking?: boolean },
 ): AnthropicMessagesPayload | undefined {
 	if (!isAnthropicMessagesPayload(payload)) {
 		return undefined;
@@ -133,7 +133,25 @@ export function buildCompactionPayload(
 	if (isRecord(next.tool_choice) && (next.tool_choice.type === "any" || next.tool_choice.type === "tool")) {
 		delete next.tool_choice;
 	}
+	// Thinking blocks already in the history stay; only this request stops thinking.
+	if (options.omitThinking) {
+		delete next.thinking;
+	}
 	return next;
+}
+
+/**
+ * Anthropic rejects `compaction` together with `context_management`. This plugin
+ * never sends both, but some gateways add `context_management` themselves when
+ * thinking is on: CLIProxyAPI (<= 8.0.8 at least) injects
+ * `clear_thinking_20251015` into every thinking request it forwards with a
+ * Claude subscription. The request is rejected before inference, so it is free
+ * to retry without thinking.
+ */
+const CONTEXT_MANAGEMENT_CONFLICT = /compaction and context_management cannot be used/i;
+
+export function isContextManagementConflict(status: number, body: string): boolean {
+	return status === 400 && CONTEXT_MANAGEMENT_CONFLICT.test(body);
 }
 
 export type AnthropicCompactionParseResult =
@@ -271,7 +289,7 @@ export function resolveAnthropicReplay(
 export type AnthropicCompactionFailureReason = "aborted" | "request-failed" | "invalid-response";
 
 export type AnthropicCompactionResult =
-	| { ok: true; block: AnthropicCompactionBlock; messageId?: string }
+	| { ok: true; block: AnthropicCompactionBlock; messageId?: string; retriedWithoutThinking?: true }
 	| { ok: false; reason: AnthropicCompactionFailureReason; status?: number; errorMessage?: string };
 
 export type ExecuteAnthropicCompactionOptions = {
@@ -295,11 +313,27 @@ export type ExecuteAnthropicCompactionOptions = {
  * Send the summary request through pi-ai, so auth, headers, thinking and message
  * serialization match Pi's own Anthropic requests. pi-ai does not know the
  * `compaction` stop reason, so a fetch wrapper keeps the raw body for parsing.
+ *
+ * If a gateway turns a thinking request into a compaction/context_management
+ * conflict, the summary is requested once more without thinking.
  */
 export async function executeAnthropicCompaction(
 	options: ExecuteAnthropicCompactionOptions,
 ): Promise<AnthropicCompactionResult> {
+	const first = await requestAnthropicCompaction(options, false);
+	if (!first.retryWithoutThinking) {
+		return first.result;
+	}
+	const retry = await requestAnthropicCompaction(options, true);
+	return retry.result.ok ? { ...retry.result, retriedWithoutThinking: true } : retry.result;
+}
+
+async function requestAnthropicCompaction(
+	options: ExecuteAnthropicCompactionOptions,
+	omitThinking: boolean,
+): Promise<{ result: AnthropicCompactionResult; retryWithoutThinking?: boolean }> {
 	let captured: { status: number; body: string } | undefined;
+	let sentThinking = false;
 	const captureFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
 		const response = await fetch(input, init);
 		const body = await response.text();
@@ -324,34 +358,42 @@ export async function executeAnthropicCompaction(
 				reasoning: options.reasoning === "off" ? undefined : options.reasoning,
 				fetch: captureFetch as typeof fetch,
 				onPayload: (payload: unknown) => {
-					const next = buildCompactionPayload(payload, options);
+					const next = buildCompactionPayload(payload, { ...options, omitThinking });
 					if (!next) throw new Error("unexpected Anthropic payload shape");
+					sentThinking = next.thinking !== undefined;
 					return next;
 				},
 			},
 		);
 	} catch (error) {
-		if (options.signal?.aborted) return { ok: false, reason: "aborted" };
-		return { ok: false, reason: "request-failed", errorMessage: error instanceof Error ? error.message : String(error) };
+		if (options.signal?.aborted) return { result: { ok: false, reason: "aborted" } };
+		return {
+			result: { ok: false, reason: "request-failed", errorMessage: error instanceof Error ? error.message : String(error) },
+		};
 	}
 
 	if (options.signal?.aborted || result.stopReason === "aborted") {
-		return { ok: false, reason: "aborted" };
+		return { result: { ok: false, reason: "aborted" } };
 	}
 	if (!captured) {
-		return { ok: false, reason: "request-failed", errorMessage: result.errorMessage ?? "no response" };
+		return { result: { ok: false, reason: "request-failed", errorMessage: result.errorMessage ?? "no response" } };
 	}
 	if (captured.status < 200 || captured.status >= 300) {
 		return {
-			ok: false,
-			reason: "request-failed",
-			status: captured.status,
-			errorMessage: result.errorMessage ?? captured.body.slice(0, 500),
+			result: {
+				ok: false,
+				reason: "request-failed",
+				status: captured.status,
+				errorMessage: result.errorMessage ?? captured.body.slice(0, 500),
+			},
+			retryWithoutThinking: sentThinking && isContextManagementConflict(captured.status, captured.body),
 		};
 	}
 
 	const parsed = parseAnthropicCompactionResponse(captured.body);
-	return parsed.ok
-		? { ok: true, block: parsed.block, messageId: parsed.messageId }
-		: { ok: false, reason: "invalid-response", status: captured.status, errorMessage: parsed.errorMessage };
+	return {
+		result: parsed.ok
+			? { ok: true, block: parsed.block, messageId: parsed.messageId }
+			: { ok: false, reason: "invalid-response", status: captured.status, errorMessage: parsed.errorMessage },
+	};
 }

@@ -109,6 +109,7 @@ When pi triggers compaction (`session_before_compact`):
    - Later requests for the same provider and model replace Pi's summary message with the block, verbatim, as the first message. Pi's kept messages stay unchanged.
    - After a switch to another provider or model, Pi's summary is sent instead. A block is never sent to a different provider or model.
    - If the provider answers a request that carries the block with HTTP 400, the block is retired for the session and Pi's summary is used.
+   - Some gateways add `context_management` to every thinking request (CLIProxyAPI does with Claude subscriptions), which Anthropic refuses next to `compaction`. On that specific 400 the summary is requested once more without thinking. Thinking blocks already in the history are still sent, and later turns keep the session's thinking level.
    - The compaction threshold stays in Pi's `compaction` settings.
 
 3. **Not a native API, or native compact failed** → if `compactionModel` is configured and differs from the current model, run pi's built-in `compact()` with that model.

@@ -176,6 +176,20 @@ describe("buildCompactionPayload", () => {
 		}
 	});
 
+	test("omitThinking drops thinking and keeps everything else", () => {
+		const source = {
+			model: "claude-opus-5-5",
+			messages: [{ role: "user", content: "hi" }],
+			thinking: { type: "adaptive", display: "summarized" },
+			output_config: { effort: "high" },
+		};
+		expect(buildCompactionPayload(source, {})!.thinking).toEqual(source.thinking);
+		const payload = buildCompactionPayload(source, { omitThinking: true })!;
+		expect(payload.thinking).toBeUndefined();
+		expect(payload.output_config).toEqual({ effort: "high" });
+		expect(payload.compaction).toEqual({ type: "summarize" });
+	});
+
 	test("puts the prior block first, verbatim, in place of Pi's summary", () => {
 		const entry = anthropicCompactionEntry("c1", "kept");
 		const payload = buildCompactionPayload(piPayload(), {
@@ -271,6 +285,94 @@ describe("executeAnthropicCompaction", () => {
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
+	});
+});
+
+describe("executeAnthropicCompaction with a gateway that injects context_management", () => {
+	const CONFLICT =
+		'{"type":"error","error":{"type":"invalid_request_error","message":"compaction and context_management cannot be used in the same request"}}';
+	const THINKING = { type: "adaptive", display: "summarized", block_binding: { prefix_mismatch_behavior: "drop_block" } };
+
+	/** Stands in for pi-ai: builds the payload through onPayload and posts it through the wrapped fetch. */
+	function fakeComplete(source: Record<string, unknown>) {
+		return (async (_model: unknown, _context: unknown, options: Record<string, any>) => {
+			const payload = await options.onPayload(structuredClone(source));
+			const response = await options.fetch("https://dev1.example.net/v1/messages", {
+				method: "POST",
+				body: JSON.stringify(payload),
+			});
+			await response.text();
+			return response.ok
+				? { stopReason: "error", errorMessage: "Unhandled stop reason: compaction" }
+				: { stopReason: "error", errorMessage: `${response.status} rejected` };
+		}) as never;
+	}
+
+	/** Rejects any body that carries thinking the way CLIProxyAPI's injection makes Anthropic reject it. */
+	async function withGateway(
+		run: () => Promise<unknown>,
+		respond: (body: Record<string, unknown>) => Response = (body) =>
+			body.thinking
+				? new Response(CONFLICT, { status: 400 })
+				: new Response(compactionSse(), { status: 200, headers: { "content-type": "text/event-stream" } }),
+	) {
+		const originalFetch = globalThis.fetch;
+		const sent: Array<Record<string, unknown>> = [];
+		globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+			const body = JSON.parse(String(init?.body));
+			sent.push(body);
+			return respond(body);
+		}) as typeof fetch;
+		try {
+			return { result: await run(), sent };
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	}
+
+	const base = { model: opus as never, systemPrompt: "sys", messages: [] };
+	const source = { model: "claude-opus-5-5", messages: [{ role: "user", content: "hi" }], thinking: THINKING };
+
+	test("retries once without thinking and returns the block", async () => {
+		const { result, sent } = await withGateway(() =>
+			executeAnthropicCompaction({ ...base, complete: fakeComplete(source) }),
+		);
+		expect(result).toEqual({ ok: true, block: BLOCK, messageId: "msg_1", retriedWithoutThinking: true });
+		expect(sent).toHaveLength(2);
+		expect(sent[0]!.thinking).toEqual(THINKING);
+		expect(sent[1]!.thinking).toBeUndefined();
+		expect(sent[1]!.compaction).toEqual({ type: "summarize" });
+		expect(sent[1]!.messages).toEqual(sent[0]!.messages);
+	});
+
+	test("does not retry when no thinking was sent", async () => {
+		const { result, sent } = await withGateway(
+			() => executeAnthropicCompaction({ ...base, complete: fakeComplete({ ...source, thinking: undefined }) }),
+			() => new Response(CONFLICT, { status: 400 }),
+		);
+		expect(sent).toHaveLength(1);
+		expect(result).toMatchObject({ ok: false, reason: "request-failed", status: 400 });
+	});
+
+	test("does not retry other 400s", async () => {
+		const { result, sent } = await withGateway(
+			() => executeAnthropicCompaction({ ...base, complete: fakeComplete(source) }),
+			() => new Response('{"type":"error","error":{"message":"prompt is too long"}}', { status: 400 }),
+		);
+		expect(sent).toHaveLength(1);
+		expect(result).toMatchObject({ ok: false, reason: "request-failed", status: 400 });
+	});
+
+	test("reports the retry's failure when the retry also fails", async () => {
+		const { result, sent } = await withGateway(
+			() => executeAnthropicCompaction({ ...base, complete: fakeComplete(source) }),
+			(body) =>
+				body.thinking
+					? new Response(CONFLICT, { status: 400 })
+					: new Response('{"type":"error","error":{"message":"overloaded"}}', { status: 529 }),
+		);
+		expect(sent).toHaveLength(2);
+		expect(result).toMatchObject({ ok: false, reason: "request-failed", status: 529 });
 	});
 });
 
