@@ -4,6 +4,7 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	SessionBeforeCompactEvent,
+	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
@@ -41,6 +42,8 @@ import {
 	createNativeCompactionResult,
 	EXTENSION_ID,
 	isNativeCompactionDetails,
+	isNativeCompactionEntry,
+	NATIVE_COMPACTION_FALLBACK_SUMMARY,
 	NATIVE_COMPACTION_STRATEGY,
 	NATIVE_COMPACTION_STRATEGY_V2,
 	type ExtensionConfig,
@@ -68,7 +71,38 @@ type RuntimeState = {
 	appendEntry?: (customType: string, data?: unknown) => void;
 	/** Compaction entry whose block the in-flight provider request carries. */
 	pendingAnthropicReplay?: string;
+	/** `${compactionEntryId}|${provider}/${model}` pairs already warned about on model_select. */
+	warnedCheckpointSwitches?: Set<string>;
 };
+
+/**
+ * Warning for a model that cannot read the latest compaction.
+ *
+ * An OpenAI native checkpoint is an opaque window that only replays for the
+ * provider and model that produced it; Pi's own summary for it is only a
+ * placeholder. Any other model would continue with the placeholder plus the
+ * kept messages. Returns undefined when the latest compaction is readable.
+ */
+export function describeUnreadableCheckpoint(
+	branchEntries: readonly SessionEntry[],
+	model: { provider: string; id: string } | undefined,
+): { key: string; message: string } | undefined {
+	const latest = findLatestCompactionEntry(branchEntries);
+	if (!model || !isNativeCompactionEntry(latest) || latest.summary !== NATIVE_COMPACTION_FALLBACK_SUMMARY) {
+		return undefined;
+	}
+	const { provider, model: checkpointModel } = latest.details;
+	if (provider === model.provider && checkpointModel === model.id) {
+		return undefined;
+	}
+	return {
+		key: `${latest.id}|${model.provider}/${model.id}`,
+		message:
+			`the latest compaction is an OpenAI native checkpoint that only ${provider}/${checkpointModel} can read. ` +
+			`${model.provider}/${model.id} will see only the messages kept after it. ` +
+			"To continue with the full history, use /tree to branch from the entry before that compaction.",
+	};
+}
 
 const DEFAULT_DEPENDENCIES: ExtensionRuntimeDependencies = {
 	loadExtensionConfig,
@@ -929,6 +963,16 @@ export function registerExtensionRuntime(
 		if (!compactionEntryId || event.status !== 400) return;
 		state.appendEntry?.(ANTHROPIC_BLOCK_REJECTED_ENTRY, { compactionEntryId });
 		notifyWarning(ctx, "provider rejected the Anthropic compaction block; replaying Pi's summary from now on");
+	});
+
+	pi.on("model_select", (event, ctx) => {
+		if (!ctx.hasUI || !dependencies.loadExtensionConfig().config.enabled) return;
+		const warning = describeUnreadableCheckpoint(ctx.sessionManager.getBranch(), event.model);
+		if (!warning) return;
+		state.warnedCheckpointSwitches ??= new Set();
+		if (state.warnedCheckpointSwitches.has(warning.key)) return;
+		state.warnedCheckpointSwitches.add(warning.key);
+		notifyWarning(ctx, warning.message);
 	});
 
 	pi.on("session_compact_failed", (event, ctx) => {

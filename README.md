@@ -103,6 +103,7 @@ When pi triggers compaction (`session_before_compact`):
    - **V2**: streams a request with `compaction_trigger` to `/responses`; the API returns an encrypted compaction blob. Retained user/developer messages + blob form the compacted context.
    - **V1**: POSTs to `/responses/compact`; receives an opaque compacted window.
    - On success, the compacted window is stored and replayed on subsequent requests via `before_provider_request`.
+   - The window is opaque and replays only for the provider and model that produced it. When the TUI selects any other model while such a checkpoint is the latest compaction, a warning explains that the new model will see only the kept messages and suggests `/tree` to branch from before the compaction (once per checkpoint and model).
 
 2. **Anthropic Messages API** (`anthropic-messages`) → send Pi's own serialized request for the messages Pi would discard, with `compaction: {type: "summarize"}` and the `compact-2026-09-04` beta:
    - The response holds one signed `compaction` block. It is stored in the compaction entry's `details`, keyed by provider, API, model and base URL. Its text is also the entry summary.
